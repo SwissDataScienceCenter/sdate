@@ -1,0 +1,12 @@
+.DS_Store
+*.h5
+*.xml
+*.tif
+*.orig
+*.log
+*.pyc
+data/*
+notebooks/comparison_results/*
+notebooks/streaming_output/*
+scripts/compression_analysis_output/*
+*.mov
