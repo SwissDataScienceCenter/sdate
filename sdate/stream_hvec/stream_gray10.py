@@ -194,7 +194,7 @@ class HevcGray10Streamer:
             raise ValueError("frame values must be in [0,1]")
 
         # convert to uint16 little-endian buffer
-        f16 = (frame * 65535.0 + 0.5).clamp_(0, 65535).to(torch.uint16).cpu().numpy()
+        f16 = (frame * 65535.0 + 0.5).clamp_(0, 65535).to(torch.int16).cpu().numpy()
         H, W = f16.shape
 
         if not self._segment_open or self._current_outfile is None:
