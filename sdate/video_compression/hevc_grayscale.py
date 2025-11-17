@@ -17,7 +17,7 @@ def encode_hevc_grayscale_10bit(
     outfile: str = "out_grayscale_10bit.mov",
     fps: int = 24,
     cq_hw: int = 90,            # VideoToolbox quality   (0–100, higher = better)
-    crf_sw: int = 14,           # libx265 CRF            (0 = lossless)
+    crf_sw: int = 0,           # libx265 CRF            (0 = lossless)
     preset_sw: str = "slow",# libx265 speed/quality  ("ultrafast" … "placebo")
     tune_grain: bool = False,   # If True, add -tune grain to libx265 (better texture retention)
     force_software: bool = False, # If True, skip hardware attempt and use libx265 directly
