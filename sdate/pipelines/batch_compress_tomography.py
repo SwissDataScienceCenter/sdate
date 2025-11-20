@@ -474,7 +474,7 @@ def batch_compress_tomography(
         # Load tomography parameters
         try:
             tomo_params = load_tomography_params(data_path)
-            tomo_params['num_projections'] = len(tiff_files) - tomo_params['num_darks'] - tomo_params['num_flats']
+            # tomo_params['num_projections'] = len(tiff_files) - tomo_params['num_darks'] - tomo_params['num_flats']
             
             if tomo_params['num_projections'] <= 0:
                 print(f"   ⚠️  Invalid structure, skipping...")
