@@ -122,7 +122,9 @@ def estimate_independent_ranges(
     sample_ratio: float = 1.0,
     min_samples: int = 5,
     max_samples: int = 10000,
-    create_histogram: bool = False
+    create_histogram: bool = False,
+    use_per_frame_percentile: bool = True,
+    percentile: float = 99.0
 ) -> Dict[str, Dict[str, float]]:
     """
     Estimate dynamic ranges independently for darks, flats, and projections.
@@ -141,12 +143,17 @@ def estimate_independent_ranges(
         Maximum number of files to sample per type
     create_histogram : bool
         Whether to create histograms (useful for debugging)
+    use_per_frame_percentile : bool
+        If True, compute per-frame percentiles instead of global max
+    percentile : float
+        Percentile value to use for max (default 99.0)
     
     Returns:
     --------
     ranges : dict
         Dictionary with 'darks', 'flats', 'projections' keys, each containing
         'min', 'max', 'range', 'width', 'height', 'dtype' information
+        If use_per_frame_percentile is True, also includes 'per_frame_max' array
     """
     num_darks = int(params['num_darks'])
     num_flats = int(params['num_flats'])
@@ -169,54 +176,104 @@ def estimate_independent_ranges(
         if len(files) == 0:
             print(f"   ⚠️  No {data_type} files found, skipping...")
             continue
-            
-        # Calculate sampling
-        num_samples = max(min_samples, min(max_samples, int(len(files) * sample_ratio)))
-        num_samples = min(num_samples, len(files))  # Can't sample more than available
         
-        sample_indices = np.linspace(0, len(files) - 1, num_samples, dtype=int)
-        
-        print(f"   📊 {data_type.capitalize()}: Sampling {num_samples}/{len(files)} files...")
-        
-        # Initialize min/max tracking
-        global_min = float('inf')
-        global_max = float('-inf')
         width, height, dtype_str = None, None, None
         
-        # Sample files to estimate range
-        for idx in tqdm(sample_indices, desc=f"  Analyzing {data_type}", leave=False):
-            img = Image.open(files[idx])
-            arr = np.array(img)
+        if use_per_frame_percentile:
+            # Compute per-frame percentiles for ALL files (not just samples)
+            print(f"   📊 {data_type.capitalize()}: Computing per-frame {percentile}th percentiles for {len(files)} files...")
             
-            # Handle different image formats
-            if arr.ndim == 3:  # Color image
-                arr = arr[:, :, 0]  # Take first channel
+            per_frame_max = np.zeros(len(files), dtype=np.float32)
+            global_min = float('inf')
             
-            # Get dimensions from first image
-            if width is None:
-                height, width = arr.shape[:2]
-                dtype_str = str(arr.dtype)
+            for idx, file_path in enumerate(tqdm(files, desc=f"  Analyzing {data_type}", leave=False)):
+                img = Image.open(file_path)
+                arr = np.array(img)
+                
+                # Handle different image formats
+                if arr.ndim == 3:  # Color image
+                    arr = arr[:, :, 0]  # Take first channel
+                
+                # Get dimensions from first image
+                if width is None:
+                    height, width = arr.shape[:2]
+                    dtype_str = str(arr.dtype)
+                
+                # Compute min and percentile for this frame
+                current_min = float(arr.min())
+                per_frame_max[idx] = np.percentile(arr, percentile)
+                global_min = min(global_min, current_min)
             
-            # Update global min/max
-            current_min = float(arr.min())
-            current_max = float(arr.max())
-            global_min = min(global_min, current_min)
-            global_max = max(global_max, current_max)
-        
-        # For compression purposes, ensure at least 10-bit range
-        global_max = max(global_max, 2**10 - 1)
-        
-        ranges[data_type] = {
-            'min': global_min,
-            'max': global_max,
-            'range': global_max - global_min,
-            'width': width,
-            'height': height,
-            'dtype': dtype_str,
-            'num_files': len(files)
-        }
-        
-        print(f"      Range: [{global_min:.1f}, {global_max:.1f}] (Δ={global_max - global_min:.1f})")
+            # Use median of per-frame percentiles as global max for range info
+            global_max = float(np.median(per_frame_max))
+            
+            # For compression purposes, ensure at least 10-bit range
+            global_max = max(global_max, 2**10 - 1)
+            
+            ranges[data_type] = {
+                'min': global_min,
+                'max': global_max,
+                'range': global_max - global_min,
+                'width': width,
+                'height': height,
+                'dtype': dtype_str,
+                'num_files': len(files),
+                'per_frame_max': per_frame_max,  # Array of per-frame max values
+                'percentile': percentile,
+                'use_per_frame': True
+            }
+            
+            print(f"      Per-frame {percentile}th percentile range: [{per_frame_max.min():.1f}, {per_frame_max.max():.1f}]")
+            print(f"      Global min: {global_min:.1f}, Median percentile: {global_max:.1f}")
+        else:
+            # Original behavior: use global min/max from samples
+            # Calculate sampling
+            num_samples = max(min_samples, min(max_samples, int(len(files) * sample_ratio)))
+            num_samples = min(num_samples, len(files))  # Can't sample more than available
+            
+            sample_indices = np.linspace(0, len(files) - 1, num_samples, dtype=int)
+            
+            print(f"   📊 {data_type.capitalize()}: Sampling {num_samples}/{len(files)} files...")
+            
+            # Initialize min/max tracking
+            global_min = float('inf')
+            global_max = float('-inf')
+            
+            # Sample files to estimate range
+            for idx in tqdm(sample_indices, desc=f"  Analyzing {data_type}", leave=False):
+                img = Image.open(files[idx])
+                arr = np.array(img)
+                
+                # Handle different image formats
+                if arr.ndim == 3:  # Color image
+                    arr = arr[:, :, 0]  # Take first channel
+                
+                # Get dimensions from first image
+                if width is None:
+                    height, width = arr.shape[:2]
+                    dtype_str = str(arr.dtype)
+                
+                # Update global min/max
+                current_min = float(arr.min())
+                current_max = float(arr.max())
+                global_min = min(global_min, current_min)
+                global_max = max(global_max, current_max)
+            
+            # For compression purposes, ensure at least 10-bit range
+            global_max = max(global_max, 2**10 - 1)
+            
+            ranges[data_type] = {
+                'min': global_min,
+                'max': global_max,
+                'range': global_max - global_min,
+                'width': width,
+                'height': height,
+                'dtype': dtype_str,
+                'num_files': len(files),
+                'use_per_frame': False
+            }
+            
+            print(f"      Range: [{global_min:.1f}, {global_max:.1f}] (Δ={global_max - global_min:.1f})")
     
     return ranges
 
@@ -318,9 +375,13 @@ def stream_tomography_to_hevc(
         start_time = time.time()
         
         try:
+            # Check if using per-frame normalization
+            use_per_frame = type_range.get('use_per_frame', False)
+            per_frame_max = type_range.get('per_frame_max', None)
+            
             with streamer.start_segment(q=quality, outfile=output_file):
                 # Process each file
-                for tiff_file in tqdm(files, desc=f"      {data_type}", leave=False):
+                for frame_idx, tiff_file in enumerate(tqdm(files, desc=f"      {data_type}", leave=False)):
                     # Load image
                     img = Image.open(tiff_file)
                     arr = np.array(img, np.int32)
@@ -329,9 +390,17 @@ def stream_tomography_to_hevc(
                     if arr.ndim == 3:
                         arr = arr[:, :, 0]
                     
-                    # Convert to tensor and normalize using type-specific range
+                    # Convert to tensor and normalize
                     frame_tensor = torch.from_numpy(arr).float()
-                    frame_tensor = (frame_tensor - type_range['min']) / (type_range['max'] - type_range['min'])
+                    
+                    if use_per_frame and per_frame_max is not None:
+                        # Use per-frame percentile for normalization
+                        frame_max = per_frame_max[frame_idx]
+                        frame_tensor = (frame_tensor - type_range['min']) / (frame_max - type_range['min'])
+                    else:
+                        # Use global range for normalization (original behavior)
+                        frame_tensor = (frame_tensor - type_range['min']) / (type_range['max'] - type_range['min'])
+                    
                     frame_tensor = torch.clamp(frame_tensor, 0.0, 1.0)
                     
                     # Append to streamer
@@ -367,6 +436,26 @@ def stream_tomography_to_hevc(
                     'range_delta': type_range['range']
                 }
                 
+                # Save normalization metadata for reconstruction
+                norm_file = output_file_path.with_suffix('.npz')
+                if type_range.get('use_per_frame', False):
+                    np.savez(
+                        norm_file,
+                        per_frame_max=type_range['per_frame_max'],
+                        global_min=type_range['min'],
+                        percentile=type_range.get('percentile', 99.0),
+                        use_per_frame=True
+                    )
+                    print(f"      💾 Saved normalization values to {norm_file.name}")
+                else:
+                    np.savez(
+                        norm_file,
+                        global_min=type_range['min'],
+                        global_max=type_range['max'],
+                        use_per_frame=False
+                    )
+                    print(f"      💾 Saved normalization values to {norm_file.name}")
+                
                 print(f"      ✅ {processed_frames} frames → {file_size_mb:.1f} MB ({compression_ratio:.1f}:1)")
             
         except Exception as e:
@@ -388,7 +477,9 @@ def batch_compress_tomography(
     force_software_encoding: bool = True,
     preset_sw: str = "slow",
     limit_num_folders: Optional[int] = None,
-    folder_id: Optional[str] = None
+    folder_id: Optional[str] = None,
+    use_per_frame_percentile: bool = True,
+    percentile: float = 99.0
 ) -> pd.DataFrame:
     """
     Batch process all tomographic TIFF sequences with independent compression.
@@ -426,6 +517,12 @@ def batch_compress_tomography(
     folder_id : Optional[str]
         If provided, only process folder named 'file_{folder_id}_extracted'.
         If None, process all folders with '_extracted' in name.
+    limit_num_folders : Optional[int]
+        Limit the number of folders to process (for testing)
+    use_per_frame_percentile : bool
+        If True, use per-frame percentile normalization (default: True)
+    percentile : float
+        Percentile value for per-frame normalization (default: 99.0)
     
     Returns:
     --------
@@ -439,6 +536,10 @@ def batch_compress_tomography(
     print(f"🎛️  Quality settings: {quality_settings}")
     print(f"⚙️  Sample ratio: {sample_ratio} ({sample_ratio*100:.1f}%)")
     print(f"🎬 FPS: {fps}, Preset: {preset_sw}, Software: {force_software_encoding}")
+    if use_per_frame_percentile:
+        print(f"📊 Per-frame normalization: {percentile}th percentile")
+    else:
+        print(f"📊 Normalization: Global min/max")
     print()
     
     # Create output directory
@@ -512,7 +613,9 @@ def batch_compress_tomography(
                 sample_ratio=sample_ratio,
                 min_samples=min_samples,
                 max_samples=max_samples,
-                create_histogram=create_histogram
+                create_histogram=create_histogram,
+                use_per_frame_percentile=use_per_frame_percentile,
+                percentile=percentile
             )
             
             estimation_time = time.time() - start_time
