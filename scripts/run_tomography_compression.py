@@ -7,13 +7,17 @@ It compresses darks, flats, and projections independently with separate range
 estimations for each type.
 
 Usage:
-    python run_tomography_compression.py
+    python run_tomography_compression.py [--folder-id FOLDER_ID]
+
+Arguments:
+    --folder-id : Optional folder ID to process only file_{folder_id}_extracted
 
 Or customize the configuration below and run directly.
 """
 
 from pathlib import Path
 import sys
+import argparse
 
 # Resolve project root based on this file's location
 CURRENT_FILE = Path(__file__).resolve()
@@ -30,6 +34,21 @@ from sdate.pipelines.batch_compress_tomography import batch_compress_tomography
 def main():
     """Run the tomographic compression pipeline with specified configuration."""
     
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description='Run tomographic data compression pipeline',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        '--folder-id',
+        type=str,
+        default=None,
+        help='Process only folder named file_{folder_id}_extracted. If not provided, process all _extracted folders.'
+    )
+    args = parser.parse_args()
+    
+    folder_id = args.folder_id
+    
     # ========================================================================
     # CONFIGURATION - Modify these parameters as needed
     # ========================================================================
@@ -41,7 +60,7 @@ def main():
     OUTPUT_PATH = Path('/das/home/barbaf_l/p22274/compression_paper/streaming_output')
     
     # Quality settings to test (0-100, higher = better quality)
-    QUALITY_SETTINGS = [100, 95, 90]
+    QUALITY_SETTINGS = [89,88, 87, 86, 85]
     
     # Sampling ratio for dynamic range estimation (1.0 = 100% of files)
     SAMPLE_RATIO = 1.0  # Use 10% for testing
@@ -61,7 +80,7 @@ def main():
     
     # Software encoding preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)
     # Slower presets = better compression but slower encoding
-    PRESET_SW = "slow"
+    PRESET_SW = "veryslow"
     
     # ========================================================================
     # RUN PIPELINE
@@ -73,6 +92,7 @@ def main():
     print("\nConfiguration:")
     print(f"  Base path: {CT_FILES_BASE_PATH}")
     print(f"  Output path: {OUTPUT_PATH}")
+    print(f"  Folder ID: {folder_id if folder_id else 'All folders'}")
     print(f"  Quality settings: {QUALITY_SETTINGS}")
     print(f"  Sample ratio: {SAMPLE_RATIO * 100:.0f}%")
     print(f"  FPS: {FPS}")
@@ -91,7 +111,8 @@ def main():
         fps=FPS,
         create_histogram=CREATE_HISTOGRAM,
         force_software_encoding=FORCE_SOFTWARE_ENCODING,
-        preset_sw=PRESET_SW
+        preset_sw=PRESET_SW,
+        folder_id=folder_id
     )
     
     # Print results summary

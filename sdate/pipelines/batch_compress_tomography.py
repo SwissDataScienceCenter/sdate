@@ -387,7 +387,8 @@ def batch_compress_tomography(
     create_histogram: bool = False,
     force_software_encoding: bool = True,
     preset_sw: str = "slow",
-    limit_num_folders: Optional[int] = None
+    limit_num_folders: Optional[int] = None,
+    folder_id: Optional[str] = None
 ) -> pd.DataFrame:
     """
     Batch process all tomographic TIFF sequences with independent compression.
@@ -422,6 +423,9 @@ def batch_compress_tomography(
         Force software encoding
     preset_sw : str
         Software encoding preset (ultrafast, fast, medium, slow, veryslow)
+    folder_id : Optional[str]
+        If provided, only process folder named 'file_{folder_id}_extracted'.
+        If None, process all folders with '_extracted' in name.
     
     Returns:
     --------
@@ -441,8 +445,20 @@ def batch_compress_tomography(
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Find all folders with TIFF files (filter for _extracted folders to avoid compressed ones)
-    ct_folders = [f for f in ct_files_base_path.iterdir() if f.is_dir() and '_extracted' in f.name]
-    ct_folders = sorted(ct_folders)
+    if folder_id is not None:
+        # Process only the specific folder with the given folder_id
+        target_folder_name = f"file_{folder_id}_extracted"
+        target_folder_path = ct_files_base_path / target_folder_name
+        if target_folder_path.exists() and target_folder_path.is_dir():
+            ct_folders = [target_folder_path]
+            print(f"🎯 Processing single folder: {target_folder_name} (folder_id={folder_id})")
+        else:
+            print(f"❌ Error: Folder '{target_folder_name}' not found in {ct_files_base_path}")
+            ct_folders = []
+    else:
+        # Process all _extracted folders
+        ct_folders = [f for f in ct_files_base_path.iterdir() if f.is_dir() and '_extracted' in f.name]
+        ct_folders = sorted(ct_folders)
     
     print(f"📂 Found {len(ct_folders)} folders to process:")
     for i, folder in enumerate(ct_folders, 1):
