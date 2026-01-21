@@ -36,12 +36,14 @@ def main():
     
     # Base path containing folders with TIFF sequences
     CT_FILES_BASE_PATH = Path('/das/home/barbaf_l/p22274/compression_paper')
+    CT_FILES_BASE_PATH = Path('data/ct_files')  # For testing locally
     
     # Output directory for compressed files and reports
     OUTPUT_PATH = Path('/das/home/barbaf_l/p22274/compression_paper/streaming_output')
+    OUTPUT_PATH = Path('data/streaming_output')  # For testing locally
     
     # Quality settings to test (0-100, higher = better quality)
-    QUALITY_SETTINGS = [100, 95, 90]
+    QUALITY_SETTINGS = [94, 93, 92, 91]
     
     # Sampling ratio for dynamic range estimation (1.0 = 100% of files)
     SAMPLE_RATIO = 1.0  # Use 10% for testing
@@ -57,11 +59,15 @@ def main():
     CREATE_HISTOGRAM = False
     
     # Force software encoding (set to False to try hardware encoding first)
-    FORCE_SOFTWARE_ENCODING = True
+    FORCE_SOFTWARE_ENCODING = False
     
     # Software encoding preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)
     # Slower presets = better compression but slower encoding
     PRESET_SW = "slow"
+    
+    # Per-frame normalization using percentiles (recommended for better quality)
+    USE_PER_FRAME_PERCENTILE = True  # Set to False to use global min/max
+    PERCENTILE = 99.0  # Use 99th percentile for per-frame normalization
     
     # ========================================================================
     # RUN PIPELINE
@@ -78,6 +84,7 @@ def main():
     print(f"  FPS: {FPS}")
     print(f"  Encoding: {'Software' if FORCE_SOFTWARE_ENCODING else 'Hardware (fallback to software)'}")
     print(f"  Preset: {PRESET_SW}")
+    print(f"  Normalization: {'Per-frame ' + str(PERCENTILE) + 'th percentile' if USE_PER_FRAME_PERCENTILE else 'Global min/max'}")
     print("\n" + "=" * 80 + "\n")
     
     # Run the pipeline
@@ -91,7 +98,9 @@ def main():
         fps=FPS,
         create_histogram=CREATE_HISTOGRAM,
         force_software_encoding=FORCE_SOFTWARE_ENCODING,
-        preset_sw=PRESET_SW
+        preset_sw=PRESET_SW,
+        use_per_frame_percentile=USE_PER_FRAME_PERCENTILE,
+        percentile=PERCENTILE
     )
     
     # Print results summary
