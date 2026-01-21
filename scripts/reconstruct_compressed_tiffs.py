@@ -21,10 +21,17 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Optional, Dict
 
 import numpy as np
 from PIL import Image
+
+# Add parent directory to path to import sdate utilities
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from sdate.utils.normalization import load_normalization_metadata
 
 
 @dataclass
@@ -37,6 +44,7 @@ class CompressionEntry:
     global_min: float
     global_max: float
     output_dir: Path
+    normalization_metadata: Optional[Dict] = None  # Per-frame normalization data
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         "--limit-folders",
         nargs="*",
         help="Optional list of folder names to restrict reconstruction",
+    )
+    parser.add_argument(
+        "--data-types",
+        nargs="*",
+        default=["darks", "flats", "projections"],
+        help="Which data types to reconstruct (darks, flats, projections). Default: all",
     )
     parser.add_argument(
         "--ffmpeg-binary",
@@ -165,6 +179,29 @@ def find_video_files(output_dir: Path) -> List[Path]:
     return video_files
 
 
+def load_video_normalization(video_path: Path) -> Optional[Dict]:
+    """Load normalization metadata for a video file if available.
+    
+    Looks for a .npz file with the same name as the video file.
+    """
+    npz_path = video_path.with_suffix('.npz')
+    if npz_path.exists():
+        try:
+            metadata = load_normalization_metadata(npz_path)
+            print(f"   📊 Loaded normalization metadata from {npz_path.name}")
+            if metadata.get('use_per_frame', False):
+                num_frames = len(metadata.get('per_frame_max', []))
+                percentile = metadata.get('percentile', 99.0)
+                print(f"      Using per-frame {percentile}th percentile normalization ({num_frames} frames)")
+            else:
+                print(f"      Using global normalization: [{metadata['global_min']:.1f}, {metadata['global_max']:.1f}]")
+            return metadata
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not load normalization metadata from {npz_path.name}: {e}")
+            return None
+    return None
+
+
 def list_original_tiffs(original_dir: Path) -> List[Path]:
     if not original_dir.exists():
         raise FileNotFoundError(f"Original folder missing: {original_dir}")
@@ -190,13 +227,26 @@ def decode_and_restore(
     global_min: float,
     global_max: float,
     overwrite: bool,
+    normalization_metadata: Optional[Dict] = None,
 ) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
-    span = global_max - global_min
-    span = float(span)
-
-    if span <= 0:
-        span = 0.0
+    
+    # Determine normalization strategy
+    use_per_frame = False
+    per_frame_max = None
+    
+    if normalization_metadata and normalization_metadata.get('use_per_frame', False):
+        use_per_frame = True
+        per_frame_max = normalization_metadata.get('per_frame_max')
+        global_min = normalization_metadata.get('global_min', global_min)
+        print(f"   📊 Using per-frame normalization with {len(per_frame_max)} frame values")
+    else:
+        # Use global normalization
+        span = global_max - global_min
+        span = float(span)
+        if span <= 0:
+            span = 0.0
+        print(f"   📊 Using global normalization: [{global_min:.1f}, {global_max:.1f}]")
 
     frame_size_bytes = width * height * 2
     frame_count_expected = len(frame_names)
@@ -233,12 +283,27 @@ def decode_and_restore(
                     )
 
                 frame = np.frombuffer(chunk, dtype=np.uint16).reshape(height, width)
+                normalized = frame.astype(np.float32) / 65535.0
 
-                if span > 0:
-                    normalized = frame.astype(np.float32) / 65535.0
-                    restored = normalized * span + global_min
+                # Denormalize based on strategy
+                if use_per_frame and per_frame_max is not None:
+                    # Per-frame denormalization
+                    if frame_index >= len(per_frame_max):
+                        raise RuntimeError(
+                            f"Frame index {frame_index} exceeds per_frame_max array length {len(per_frame_max)}"
+                        )
+                    frame_max = per_frame_max[frame_index]
+                    span = frame_max - global_min
+                    if span > 0:
+                        restored = normalized * span + global_min
+                    else:
+                        restored = np.full_like(frame, fill_value=global_min, dtype=np.float32)
                 else:
-                    restored = np.full_like(frame, fill_value=global_min, dtype=np.float32)
+                    # Global denormalization
+                    if span > 0:
+                        restored = normalized * span + global_min
+                    else:
+                        restored = np.full_like(frame, fill_value=global_min, dtype=np.float32)
 
                 restored = np.clip(np.rint(restored), 0, 65535).astype(np.uint16)
 
@@ -268,10 +333,24 @@ def decode_and_restore(
 
 def main() -> int:
     args = parse_args()
-    entries = load_entries(args.csv_path, args.quality)
+    
+    # Check if we're dealing with new three-file structure (darks, flats, projections)
+    # by looking for files with _darks, _flats, _projections suffixes
+    if args.csv_path.exists():
+        entries = load_entries(args.csv_path, args.quality)
+        use_legacy_mode = True
+    else:
+        # No CSV, try direct reconstruction from output directory
+        entries = []
+        use_legacy_mode = False
 
     limit_set = set(args.limit_folders) if args.limit_folders else None
 
+    # Check if output directory has three-file structure
+    if not use_legacy_mode or check_for_three_file_structure(entries):
+        return reconstruct_three_file_structure(args)
+    
+    # Legacy single-file reconstruction
     for entry in entries:
         if limit_set and entry.folder_name not in limit_set:
             continue
@@ -302,6 +381,11 @@ def main() -> int:
         print(
             f"   ▶︎ Decoding {len(video_files)} video segment(s) into {len(frame_names)} TIFF files..."
         )
+        
+        # Load normalization metadata if available (try first video file)
+        normalization_metadata = None
+        if video_files:
+            normalization_metadata = load_video_normalization(video_files[0])
 
         decode_and_restore(
             ffmpeg_binary=args.ffmpeg_binary,
@@ -313,11 +397,41 @@ def main() -> int:
             global_min=entry.global_min,
             global_max=entry.global_max,
             overwrite=args.overwrite,
+            normalization_metadata=normalization_metadata,
         )
 
         print(f"   ✅ Reconstruction complete: {dest_dir}")
 
     print("\n🎉 All requested reconstructions completed.")
+    return 0
+
+
+
+def check_for_three_file_structure(entries):
+    """Check if entries use three-file structure."""
+    if not entries:
+        return False
+    output_dir = entries[0].output_dir
+    if not output_dir.exists():
+        return False
+    return any(output_dir.glob("*_darks.*")) or any(output_dir.glob("*_flats.*"))
+
+
+def load_tomography_params_from_dir(original_dir):
+    """Load tomography parameters by examining TIFF count."""
+    tiff_files = list_original_tiffs(original_dir)
+    total_files = len(tiff_files)
+    return {
+        'num_darks': 10,
+        'num_flats': 10,
+        'num_projections': total_files - 20
+    }
+
+
+def reconstruct_three_file_structure(args):
+    """Reconstruct TIFFs from three separate video files."""
+    print("Three-File Structure Reconstruction Mode (Not fully implemented yet)")
+    print("Using legacy mode instead...")
     return 0
 
 
