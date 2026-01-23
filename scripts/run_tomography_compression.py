@@ -55,15 +55,15 @@ def main():
     
     # Base path containing folders with TIFF sequences
     CT_FILES_BASE_PATH = Path('/das/home/barbaf_l/p22274/compression_paper')
-    CT_FILES_BASE_PATH = Path('data/ct_files')  # For testing locally
+    # CT_FILES_BASE_PATH = Path('data/ct_files')  # For testing locally
     
     # Output directory for compressed files and reports
     OUTPUT_PATH = Path('/das/home/barbaf_l/p22274/compression_paper/streaming_output')
-    OUTPUT_PATH = Path('data/streaming_output')  # For testing locally
+    # OUTPUT_PATH = Path('data/streaming_output')  # For testing locally
     
     # Quality settings to test (0-100, higher = better quality)
 
-    QUALITY_SETTINGS = [100]
+    QUALITY_SETTINGS = [99, 95, 90, 85, 80]  # Recommended quality levels
     
     # Sampling ratio for dynamic range estimation (1.0 = 100% of files)
     SAMPLE_RATIO = 1.0  # Use 10% for testing
@@ -79,11 +79,11 @@ def main():
     CREATE_HISTOGRAM = False
     
     # Force software encoding (set to False to try hardware encoding first)
-    FORCE_SOFTWARE_ENCODING = False
+    FORCE_SOFTWARE_ENCODING = True
     
     # Software encoding preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)
     # Slower presets = better compression but slower encoding
-    PRESET_SW = "veryslow"
+    PRESET_SW = "slow"
     
     # Per-frame normalization using percentiles (recommended for better quality)
     USE_PER_FRAME_PERCENTILE = True  # Set to False to use global min/max

@@ -13,11 +13,19 @@
 # This script runs the batch compression pipeline on SLURM
 # 
 # Usage:
-#   sbatch run_tomography_compression.sh
+#   sbatch run_tomography_compression.sh                  # Process all folders
+#   sbatch run_tomography_compression.sh <folder_id>       # Process single folder
+#
+# Examples:
+#   sbatch run_tomography_compression.sh                  # All folders
+#   sbatch run_tomography_compression.sh 12345            # Only file_12345_extracted
 #
 # Monitor:
 #   squeue -u $USER
 #   tail -f logs/tomo_compress_JOBID.out
+
+# Parse optional folder_id argument
+FOLDER_ID=${1:-}  # Empty string if not provided
 
 echo "========================================================================"
 echo "Tomographic Data Compression Pipeline"
@@ -26,6 +34,11 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
 echo "Started at: $(date)"
 echo "Working directory: $(pwd)"
+if [ -n "$FOLDER_ID" ]; then
+    echo "Folder ID: $FOLDER_ID (processing file_${FOLDER_ID}_extracted only)"
+else
+    echo "Folder ID: Not specified (processing all folders)"
+fi
 echo ""
 
 # Create logs directory if it doesn't exist
@@ -57,7 +70,12 @@ echo "Starting compression pipeline..."
 echo "========================================================================"
 echo ""
 
-python run_tomography_compression.py
+# Build command with optional folder_id
+if [ -n "$FOLDER_ID" ]; then
+    python run_tomography_compression.py --folder-id "$FOLDER_ID"
+else
+    python run_tomography_compression.py
+fi
 
 # Capture exit code
 EXIT_CODE=$?
