@@ -319,12 +319,7 @@ def estimate_independent_ranges(
                 global_min = min(global_min, current_min)
             
             # Use median of per-frame percentiles as global max for range info
-            global_max = float(np.median(per_frame_max))
-            
-            # For attenuation, don't force 10-bit range as values are typically small (0-5)
-            if not is_attenuation_projection:
-                # For compression purposes, ensure at least 10-bit range
-                global_max = max(global_max, 2**10 - 1)
+            global_max = float(np.max(per_frame_max))
             
             ranges[data_type] = {
                 'min': global_min,
@@ -376,8 +371,6 @@ def estimate_independent_ranges(
                 global_min = min(global_min, current_min)
                 global_max = max(global_max, current_max)
             
-            # For compression purposes, ensure at least 10-bit range
-            global_max = max(global_max, 2**10 - 1)
             
             ranges[data_type] = {
                 'min': global_min,
