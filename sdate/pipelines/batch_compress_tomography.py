@@ -47,6 +47,96 @@ from tqdm.auto import tqdm
 from sdate.stream_hvec import HevcGray10Streamer, EncoderParams
 
 
+def compute_attenuation(projection: np.ndarray, dark_mean: np.ndarray, flat_mean: np.ndarray, 
+                        epsilon: float = 1e-6) -> np.ndarray:
+    """
+    Compute attenuation from a projection using flat-field and dark-field correction.
+    
+    Attenuation formula: μ = -ln((I - dark) / (flat - dark))
+    
+    Parameters:
+    -----------
+    projection : ndarray
+        Raw projection image
+    dark_mean : ndarray
+        Mean dark-field image
+    flat_mean : ndarray
+        Mean flat-field image
+    epsilon : float
+        Small value to avoid division by zero and log of zero
+        
+    Returns:
+    --------
+    attenuation : ndarray
+        Attenuation-corrected image (μ values)
+    """
+    # Compute the denominator (flat - dark)
+    denominator = flat_mean - dark_mean
+    # Avoid division by zero
+    denominator = np.maximum(denominator, epsilon)
+    
+    # Compute the normalized transmission
+    transmission = (projection.astype(np.float32) - dark_mean) / denominator
+    
+    # Clip transmission to avoid log of zero or negative values
+    transmission = np.clip(transmission, epsilon, None)
+    
+    # Compute attenuation (Beer-Lambert law)
+    attenuation = -np.log(transmission)
+    
+    return attenuation
+
+
+def compute_mean_dark_flat(tiff_files: List[Path], num_darks: int, num_flats: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute mean dark and flat field images from TIFF files.
+    
+    Parameters:
+    -----------
+    tiff_files : List[Path]
+        List of all TIFF file paths (ordered: darks, flats, projections)
+    num_darks : int
+        Number of dark frames
+    num_flats : int
+        Number of flat frames
+        
+    Returns:
+    --------
+    dark_mean : ndarray
+        Mean dark-field image (float32)
+    flat_mean : ndarray
+        Mean flat-field image (float32)
+    """
+    print(f"   📊 Computing mean dark and flat field images...")
+    
+    # Load dark frames and compute mean
+    dark_files = tiff_files[:num_darks]
+    dark_images = []
+    for f in tqdm(dark_files, desc="      Loading darks", leave=False):
+        img = Image.open(f)
+        arr = np.array(img)
+        if arr.ndim == 3:
+            arr = arr[:, :, 0]
+        dark_images.append(arr)
+    dark_mean = np.mean(dark_images, axis=0).astype(np.float32)
+    
+    # Load flat frames and compute mean
+    flat_files = tiff_files[num_darks:num_darks + num_flats]
+    flat_images = []
+    for f in tqdm(flat_files, desc="      Loading flats", leave=False):
+        img = Image.open(f)
+        arr = np.array(img)
+        if arr.ndim == 3:
+            arr = arr[:, :, 0]
+        flat_images.append(arr)
+    flat_mean = np.mean(flat_images, axis=0).astype(np.float32)
+    
+    print(f"      Dark mean range: [{dark_mean.min():.1f}, {dark_mean.max():.1f}]")
+    print(f"      Flat mean range: [{flat_mean.min():.1f}, {flat_mean.max():.1f}]")
+    
+    return dark_mean, flat_mean
+
+
 def load_tomography_params(data_folder: Path) -> Dict[str, int]:
     """
     Load tomography parameters from log file or estimate from TIFF files.
@@ -124,7 +214,10 @@ def estimate_independent_ranges(
     max_samples: int = 10000,
     create_histogram: bool = False,
     use_per_frame_percentile: bool = True,
-    percentile: float = 99.0
+    percentile: float = 99.0,
+    use_attenuation: bool = False,
+    dark_mean: Optional[np.ndarray] = None,
+    flat_mean: Optional[np.ndarray] = None
 ) -> Dict[str, Dict[str, float]]:
     """
     Estimate dynamic ranges independently for darks, flats, and projections.
@@ -147,6 +240,12 @@ def estimate_independent_ranges(
         If True, compute per-frame percentiles instead of global max
     percentile : float
         Percentile value to use for max (default 99.0)
+    use_attenuation : bool
+        If True, compute ranges for attenuation-corrected projections instead of raw
+    dark_mean : ndarray, optional
+        Mean dark-field image (required if use_attenuation=True)
+    flat_mean : ndarray, optional
+        Mean flat-field image (required if use_attenuation=True)
     
     Returns:
     --------
@@ -154,6 +253,7 @@ def estimate_independent_ranges(
         Dictionary with 'darks', 'flats', 'projections' keys, each containing
         'min', 'max', 'range', 'width', 'height', 'dtype' information
         If use_per_frame_percentile is True, also includes 'per_frame_max' array
+        If use_attenuation is True, projections will have 'use_attenuation' flag
     """
     num_darks = int(params['num_darks'])
     num_flats = int(params['num_flats'])
@@ -165,6 +265,8 @@ def estimate_independent_ranges(
     projection_files = tiff_files[num_darks + num_flats:num_darks + num_flats + num_projections]
     
     print(f"🔍 Estimating independent dynamic ranges...")
+    if use_attenuation:
+        print(f"   📐 ATTENUATION MODE: Projections will be flat/dark corrected")
     print(f"   Darks: {len(dark_files)} files")
     print(f"   Flats: {len(flat_files)} files")
     print(f"   Projections: {len(projection_files)} files")
@@ -177,16 +279,23 @@ def estimate_independent_ranges(
             print(f"   ⚠️  No {data_type} files found, skipping...")
             continue
         
+        # Skip darks and flats if using attenuation mode (they are used for correction, not compressed)
+        if use_attenuation and data_type in ['darks', 'flats']:
+            print(f"   ⏭️  Skipping {data_type} (used for attenuation correction only)")
+            continue
+        
         width, height, dtype_str = None, None, None
+        is_attenuation_projection = (use_attenuation and data_type == 'projections')
         
         if use_per_frame_percentile:
             # Compute per-frame percentiles for ALL files (not just samples)
-            print(f"   📊 {data_type.capitalize()}: Computing per-frame {percentile}th percentiles for {len(files)} files...")
+            mode_str = "attenuation" if is_attenuation_projection else data_type
+            print(f"   📊 {mode_str.capitalize()}: Computing per-frame {percentile}th percentiles for {len(files)} files...")
             
             per_frame_max = np.zeros(len(files), dtype=np.float32)
             global_min = float('inf')
             
-            for idx, file_path in enumerate(tqdm(files, desc=f"  Analyzing {data_type}", leave=False)):
+            for idx, file_path in enumerate(tqdm(files, desc=f"  Analyzing {mode_str}", leave=False)):
                 img = Image.open(file_path)
                 arr = np.array(img)
                 
@@ -194,21 +303,28 @@ def estimate_independent_ranges(
                 if arr.ndim == 3:  # Color image
                     arr = arr[:, :, 0]  # Take first channel
                 
+                # Apply attenuation correction if enabled for projections
+                if is_attenuation_projection:
+                    arr = compute_attenuation(arr, dark_mean, flat_mean)
+                
                 # Get dimensions from first image
                 if width is None:
                     height, width = arr.shape[:2]
-                    dtype_str = str(arr.dtype)
+                    dtype_str = str(arr.dtype) if not is_attenuation_projection else 'float32'
                 
                 # Compute min and percentile for this frame
-                current_min = float(arr.min())
-                per_frame_max[idx] = np.percentile(arr, percentile)
+                valid_arr = arr[np.isfinite(arr)]  # Filter out inf/nan for attenuation
+                current_min = float(valid_arr.min()) if len(valid_arr) > 0 else 0.0
+                per_frame_max[idx] = np.percentile(valid_arr, percentile) if len(valid_arr) > 0 else 1.0
                 global_min = min(global_min, current_min)
             
             # Use median of per-frame percentiles as global max for range info
             global_max = float(np.median(per_frame_max))
             
-            # For compression purposes, ensure at least 10-bit range
-            global_max = max(global_max, 2**10 - 1)
+            # For attenuation, don't force 10-bit range as values are typically small (0-5)
+            if not is_attenuation_projection:
+                # For compression purposes, ensure at least 10-bit range
+                global_max = max(global_max, 2**10 - 1)
             
             ranges[data_type] = {
                 'min': global_min,
@@ -220,7 +336,8 @@ def estimate_independent_ranges(
                 'num_files': len(files),
                 'per_frame_max': per_frame_max,  # Array of per-frame max values
                 'percentile': percentile,
-                'use_per_frame': True
+                'use_per_frame': True,
+                'use_attenuation': is_attenuation_projection
             }
             
             print(f"      Per-frame {percentile}th percentile range: [{per_frame_max.min():.1f}, {per_frame_max.max():.1f}]")
@@ -270,7 +387,8 @@ def estimate_independent_ranges(
                 'height': height,
                 'dtype': dtype_str,
                 'num_files': len(files),
-                'use_per_frame': False
+                'use_per_frame': False,
+                'use_attenuation': is_attenuation_projection
             }
             
             print(f"      Range: [{global_min:.1f}, {global_max:.1f}] (Δ={global_max - global_min:.1f})")
@@ -287,7 +405,10 @@ def stream_tomography_to_hevc(
     quality: int = 90,
     fps: int = 30,
     force_software: bool = False,
-    preset_sw: str = "medium"
+    preset_sw: str = "medium",
+    use_attenuation: bool = False,
+    dark_mean: Optional[np.ndarray] = None,
+    flat_mean: Optional[np.ndarray] = None
 ) -> Dict[str, any]:
     """
     Stream compress darks, flats, and projections independently to separate HEVC files.
@@ -312,6 +433,12 @@ def stream_tomography_to_hevc(
         Whether to force software encoding
     preset_sw : str
         Software encoding preset
+    use_attenuation : bool
+        If True, compress attenuation-corrected projections instead of raw
+    dark_mean : ndarray, optional
+        Mean dark-field image (required if use_attenuation=True)
+    flat_mean : ndarray, optional
+        Mean flat-field image (required if use_attenuation=True)
     
     Returns:
     --------
@@ -350,24 +477,35 @@ def stream_tomography_to_hevc(
     }
     
     # Process each type independently
-    for data_type, files, type_range in [
+    # In attenuation mode, skip darks and flats (they were used for correction)
+    types_to_process = [
         ('darks', dark_files, ranges.get('darks')),
         ('flats', flat_files, ranges.get('flats')),
         ('projections', projection_files, ranges.get('projections'))
-    ]:
+    ]
+    
+    for data_type, files, type_range in types_to_process:
+        # Skip darks and flats in attenuation mode
+        if use_attenuation and data_type in ['darks', 'flats']:
+            print(f"   ⏭️  Skipping {data_type} (attenuation mode - used for correction)")
+            continue
+            
         if type_range is None or len(files) == 0:
             print(f"   ⚠️  Skipping {data_type} (no data)")
             continue
         
-        print(f"   🎬 Compressing {data_type}: {len(files)} files...")
+        is_attenuation_projection = type_range.get('use_attenuation', False)
+        mode_str = "attenuation" if is_attenuation_projection else data_type
+        print(f"   🎬 Compressing {mode_str}: {len(files)} files...")
         
         # Create output filename
-        output_file = f"{folder_name}_q{quality}_{data_type}.mov"
+        suffix = "_attenuation" if is_attenuation_projection else ""
+        output_file = f"{folder_name}_q{quality}_{data_type}{suffix}.mov"
         
         # Create streamer
         streamer = HevcGray10Streamer(
             base_path=output_path,
-            segment_prefix=f"{folder_name}_{data_type}",
+            segment_prefix=f"{folder_name}_{data_type}{suffix}",
             params=encoder_params,
         )
         
@@ -381,7 +519,7 @@ def stream_tomography_to_hevc(
             
             with streamer.start_segment(q=quality, outfile=output_file):
                 # Process each file
-                for frame_idx, tiff_file in enumerate(tqdm(files, desc=f"      {data_type}", leave=False)):
+                for frame_idx, tiff_file in enumerate(tqdm(files, desc=f"      {mode_str}", leave=False)):
                     # Load image
                     img = Image.open(tiff_file)
                     arr = np.array(img, np.int32)
@@ -390,16 +528,28 @@ def stream_tomography_to_hevc(
                     if arr.ndim == 3:
                         arr = arr[:, :, 0]
                     
+                    # Apply attenuation correction if enabled for projections
+                    if is_attenuation_projection:
+                        arr = compute_attenuation(arr.astype(np.float32), dark_mean, flat_mean)
+                    
                     # Convert to tensor and normalize
                     frame_tensor = torch.from_numpy(arr).float()
                     
                     if use_per_frame and per_frame_max is not None:
                         # Use per-frame percentile for normalization
                         frame_max = per_frame_max[frame_idx]
-                        frame_tensor = (frame_tensor - type_range['min']) / (frame_max - type_range['min'])
+                        span = frame_max - type_range['min']
+                        if span > 0:
+                            frame_tensor = (frame_tensor - type_range['min']) / span
+                        else:
+                            frame_tensor = torch.zeros_like(frame_tensor)
                     else:
                         # Use global range for normalization (original behavior)
-                        frame_tensor = (frame_tensor - type_range['min']) / (type_range['max'] - type_range['min'])
+                        span = type_range['max'] - type_range['min']
+                        if span > 0:
+                            frame_tensor = (frame_tensor - type_range['min']) / span
+                        else:
+                            frame_tensor = torch.zeros_like(frame_tensor)
                     
                     frame_tensor = torch.clamp(frame_tensor, 0.0, 1.0)
                     
@@ -433,27 +583,37 @@ def stream_tomography_to_hevc(
                     'fps_processing': processed_frames / compression_time if compression_time > 0 else 0,
                     'range_min': type_range['min'],
                     'range_max': type_range['max'],
-                    'range_delta': type_range['range']
+                    'range_delta': type_range['range'],
+                    'use_attenuation': is_attenuation_projection
                 }
                 
                 # Save normalization metadata for reconstruction
                 norm_file = output_file_path.with_suffix('.npz')
                 if type_range.get('use_per_frame', False):
-                    np.savez(
-                        norm_file,
-                        per_frame_max=type_range['per_frame_max'],
-                        global_min=type_range['min'],
-                        percentile=type_range.get('percentile', 99.0),
-                        use_per_frame=True
-                    )
+                    save_dict = {
+                        'per_frame_max': type_range['per_frame_max'],
+                        'global_min': type_range['min'],
+                        'percentile': type_range.get('percentile', 99.0),
+                        'use_per_frame': True,
+                        'use_attenuation': is_attenuation_projection
+                    }
+                    # If using attenuation, also save dark and flat means for reconstruction
+                    if is_attenuation_projection and dark_mean is not None and flat_mean is not None:
+                        save_dict['dark_mean'] = dark_mean
+                        save_dict['flat_mean'] = flat_mean
+                    np.savez(norm_file, **save_dict)
                     print(f"      💾 Saved normalization values to {norm_file.name}")
                 else:
-                    np.savez(
-                        norm_file,
-                        global_min=type_range['min'],
-                        global_max=type_range['max'],
-                        use_per_frame=False
-                    )
+                    save_dict = {
+                        'global_min': type_range['min'],
+                        'global_max': type_range['max'],
+                        'use_per_frame': False,
+                        'use_attenuation': is_attenuation_projection
+                    }
+                    if is_attenuation_projection and dark_mean is not None and flat_mean is not None:
+                        save_dict['dark_mean'] = dark_mean
+                        save_dict['flat_mean'] = flat_mean
+                    np.savez(norm_file, **save_dict)
                     print(f"      💾 Saved normalization values to {norm_file.name}")
                 
                 print(f"      ✅ {processed_frames} frames → {file_size_mb:.1f} MB ({compression_ratio:.1f}:1)")
@@ -479,7 +639,8 @@ def batch_compress_tomography(
     limit_num_folders: Optional[int] = None,
     folder_id: Optional[str] = None,
     use_per_frame_percentile: bool = True,
-    percentile: float = 99.0
+    percentile: float = 99.0,
+    use_attenuation: bool = False
 ) -> pd.DataFrame:
     """
     Batch process all tomographic TIFF sequences with independent compression.
@@ -523,6 +684,10 @@ def batch_compress_tomography(
         If True, use per-frame percentile normalization (default: True)
     percentile : float
         Percentile value for per-frame normalization (default: 99.0)
+    use_attenuation : bool
+        If True, compress attenuation-corrected projections instead of raw.
+        In this mode, darks and flats are used for correction but not compressed.
+        The metadata includes dark/flat means for reconstruction back to raw.
     
     Returns:
     --------
@@ -540,6 +705,8 @@ def batch_compress_tomography(
         print(f"📊 Per-frame normalization: {percentile}th percentile")
     else:
         print(f"📊 Normalization: Global min/max")
+    if use_attenuation:
+        print(f"📐 ATTENUATION MODE: Compressing μ = -ln((I-dark)/(flat-dark))")
     print()
     
     # Create output directory
@@ -602,6 +769,17 @@ def batch_compress_tomography(
             print(f"   ❌ Error loading parameters: {e}")
             continue
         
+        # Compute dark/flat means if using attenuation mode
+        dark_mean, flat_mean = None, None
+        if use_attenuation:
+            try:
+                dark_mean, flat_mean = compute_mean_dark_flat(
+                    tiff_files, tomo_params['num_darks'], tomo_params['num_flats']
+                )
+            except Exception as e:
+                print(f"   ❌ Error computing dark/flat means: {e}")
+                continue
+        
         # Estimate independent ranges
         try:
             print(f"   🔍 Estimating independent ranges...")
@@ -615,7 +793,10 @@ def batch_compress_tomography(
                 max_samples=max_samples,
                 create_histogram=create_histogram,
                 use_per_frame_percentile=use_per_frame_percentile,
-                percentile=percentile
+                percentile=percentile,
+                use_attenuation=use_attenuation,
+                dark_mean=dark_mean,
+                flat_mean=flat_mean
             )
             
             estimation_time = time.time() - start_time
@@ -630,7 +811,8 @@ def batch_compress_tomography(
             print(f"\n   🎬 [{quality_idx}/{len(quality_settings)}] Quality {quality}")
             
             # Create output directory for this folder/quality
-            folder_output_path = output_path / f"{folder_name}_q{quality}"
+            suffix = "_attenuation" if use_attenuation else ""
+            folder_output_path = output_path / f"{folder_name}_q{quality}{suffix}"
             folder_output_path.mkdir(parents=True, exist_ok=True)
             
             try:
@@ -646,7 +828,10 @@ def batch_compress_tomography(
                     quality=quality,
                     fps=fps,
                     force_software=force_software_encoding,
-                    preset_sw=preset_sw
+                    preset_sw=preset_sw,
+                    use_attenuation=use_attenuation,
+                    dark_mean=dark_mean,
+                    flat_mean=flat_mean
                 )
                 
                 total_compression_time = time.time() - start_time
@@ -655,6 +840,7 @@ def batch_compress_tomography(
                 result_entry = {
                     'folder_name': folder_name,
                     'quality': quality,
+                    'use_attenuation': use_attenuation,
                     'num_tiff_files_total': len(tiff_files),
                     'num_darks': tomo_params['num_darks'],
                     'num_flats': tomo_params['num_flats'],
