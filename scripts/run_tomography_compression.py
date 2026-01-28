@@ -45,9 +45,16 @@ def main():
         default=None,
         help='Process only folder named file_{folder_id}_extracted. If not provided, process all _extracted folders.'
     )
+    parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        default=False,
+        help='Overwrite existing results in CSV. If not set, skip already processed folder/quality combinations.'
+    )
     args = parser.parse_args()
     
     folder_id = args.folder_id
+    overwrite = args.overwrite
     
     # ========================================================================
     # CONFIGURATION - Modify these parameters as needed
@@ -63,7 +70,7 @@ def main():
     
     # Quality settings to test (0-100, higher = better quality)
 
-    QUALITY_SETTINGS = [99, 95, 90, 85, 80]  # Recommended quality levels
+    QUALITY_SETTINGS = [100, 95, 90]  # Recommended quality levels
     
     # Sampling ratio for dynamic range estimation (1.0 = 100% of files)
     SAMPLE_RATIO = 1.0  # Use 10% for testing
@@ -87,7 +94,19 @@ def main():
     
     # Per-frame normalization using percentiles (recommended for better quality)
     USE_PER_FRAME_PERCENTILE = True  # Set to False to use global min/max
-    PERCENTILE = 99.0  # Use 99th percentile for per-frame normalization
+    LOW_PERCENTILE = 0.0   # Lower percentile for per-frame normalization (default: 1st)
+    HIGH_PERCENTILE = 100  # Upper percentile for per-frame normalization (default: 99th)
+
+    # Correction mode settings
+    # USE_ATTENUATION: Compresses μ = -ln((I-dark)/(flat-dark)) - clips transmission, may lose info
+    # USE_TRANSMISSION: Compresses T = (I-dark)/(flat-dark) - unclipped, preserves all information
+    # Only one can be True at a time. If both False, raw projections are compressed.
+    USE_ATTENUATION = False   # Whether to use attenuation correction (clips transmission)
+    USE_TRANSMISSION = False   # Whether to use unclipped transmission (preserves all info)
+    
+    # CDF normalization settings (per-frame histogram equalization for more uniform distribution)
+    USE_CDF_NORMALIZATION = False  # Set to True to apply per-frame CDF-based histogram equalization
+    CDF_NUM_BINS = 2000  # Number of bins for CDF histogram computation
     
     # ========================================================================
     # RUN PIPELINE
@@ -105,7 +124,18 @@ def main():
     print(f"  FPS: {FPS}")
     print(f"  Encoding: {'Software' if FORCE_SOFTWARE_ENCODING else 'Hardware (fallback to software)'}")
     print(f"  Preset: {PRESET_SW}")
-    print(f"  Normalization: {'Per-frame ' + str(PERCENTILE) + 'th percentile' if USE_PER_FRAME_PERCENTILE else 'Global min/max'}")
+    print(f"  Overwrite existing: {overwrite}")
+    if USE_PER_FRAME_PERCENTILE:
+        print(f"  Normalization: Per-frame [{LOW_PERCENTILE}th, {HIGH_PERCENTILE}th] percentile")
+    else:
+        print(f"  Normalization: Global min/max")
+    if USE_ATTENUATION:
+        print(f"  Correction mode: Attenuation (μ = -ln(T), clipped)")
+    elif USE_TRANSMISSION:
+        print(f"  Correction mode: Transmission (T = (I-dark)/(flat-dark), unclipped)")
+    else:
+        print(f"  Correction mode: None (raw projections)")
+    print(f"  CDF normalization: {'Per-frame (bins=' + str(CDF_NUM_BINS) + ')' if USE_CDF_NORMALIZATION else 'Disabled'}")
     print("\n" + "=" * 80 + "\n")
     
     # Run the pipeline
@@ -122,7 +152,13 @@ def main():
         preset_sw=PRESET_SW,
         folder_id=folder_id,
         use_per_frame_percentile=USE_PER_FRAME_PERCENTILE,
-        percentile=PERCENTILE
+        low_percentile=LOW_PERCENTILE,
+        high_percentile=HIGH_PERCENTILE,
+        use_attenuation=USE_ATTENUATION,
+        use_transmission=USE_TRANSMISSION,
+        use_cdf_normalization=USE_CDF_NORMALIZATION,
+        cdf_num_bins=CDF_NUM_BINS,
+        overwrite=overwrite
     )
     
     # Print results summary
