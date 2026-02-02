@@ -6,7 +6,7 @@ during compression, enabling accurate reconstruction of the original data.
 """
 
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 import numpy as np
 
 
@@ -377,3 +377,211 @@ def load_cdf_mapping(filepath: Union[str, Path]) -> Dict:
         mapping['hist'] = None
     
     return mapping
+
+
+# ============================================================================
+# Per-Frame CDF Mapping for Video Sequences
+# ============================================================================
+
+def compute_frame_cdf_mapping(
+    normalized_frame: np.ndarray,
+    num_bins: int = 1000
+) -> Dict:
+    """
+    Compute a CDF mapping for a single normalized [0,1] frame.
+    
+    This creates a histogram equalization mapping that transforms the frame's
+    pixel values to a more uniform distribution.
+    
+    Parameters:
+    -----------
+    normalized_frame : ndarray
+        Frame with values in [0, 1], shape (H, W)
+    num_bins : int, default=1000
+        Number of bins for the histogram
+        
+    Returns:
+    --------
+    mapping : dict
+        Dictionary containing:
+        - 'bin_edges': array of bin edges (length num_bins + 1)
+        - 'bin_centers': array of bin centers (length num_bins)
+        - 'cdf': cumulative distribution function values [0, 1] (length num_bins)
+        - 'num_bins': number of bins used
+    """
+    # Flatten valid values
+    valid_data = normalized_frame[np.isfinite(normalized_frame)].flatten()
+    
+    # Clamp to [0, 1] for robustness
+    valid_data = np.clip(valid_data, 0.0, 1.0)
+    
+    # Compute histogram in [0, 1] range
+    hist, bin_edges = np.histogram(valid_data, bins=num_bins, range=(0.0, 1.0))
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # Compute CDF (normalized to [0, 1])
+    cdf = np.cumsum(hist).astype(np.float64)
+    if cdf[-1] > 0:
+        cdf = cdf / cdf[-1]  # Normalize to [0, 1]
+    else:
+        cdf = np.linspace(0, 1, num_bins)
+    
+    return {
+        'bin_edges': bin_edges.astype(np.float32),
+        'bin_centers': bin_centers.astype(np.float32),
+        'cdf': cdf.astype(np.float32),
+        'num_bins': num_bins
+    }
+
+
+def compute_and_apply_frame_cdf(
+    normalized_frame: np.ndarray,
+    num_bins: int = 1000
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Compute CDF mapping for a frame and apply it in one step.
+    
+    This is the main function for per-frame CDF normalization during compression.
+    
+    Parameters:
+    -----------
+    normalized_frame : ndarray
+        Frame with values already normalized to [0, 1]
+    num_bins : int, default=1000
+        Number of bins for the histogram
+        
+    Returns:
+    --------
+    mapped_frame : ndarray
+        Frame with CDF-equalized values in [0, 1]
+    cdf_mapping : dict
+        The CDF mapping used (for saving and later inversion)
+    """
+    # Compute CDF for this frame
+    cdf_mapping = compute_frame_cdf_mapping(normalized_frame, num_bins)
+    
+    # Apply CDF mapping
+    mapped_frame = apply_cdf_to_normalized(normalized_frame, cdf_mapping)
+    
+    return mapped_frame, cdf_mapping
+
+
+# Keep for backwards compatibility
+def compute_global_cdf_mapping(
+    normalized_frames: np.ndarray,
+    num_bins: int = 1000
+) -> Dict:
+    """
+    Compute a global CDF mapping from a collection of normalized [0,1] frames.
+    
+    This creates a histogram equalization mapping that transforms already-normalized
+    pixel values (in [0,1]) to a more uniform distribution, potentially improving
+    compression efficiency.
+    
+    Parameters:
+    -----------
+    normalized_frames : ndarray
+        Array of normalized frames with values in [0, 1], shape (N, H, W)
+    num_bins : int, default=1000
+        Number of bins for the histogram
+        
+    Returns:
+    --------
+    mapping : dict
+        Dictionary containing:
+        - 'bin_edges': array of bin edges (length num_bins + 1)
+        - 'bin_centers': array of bin centers (length num_bins)
+        - 'cdf': cumulative distribution function values [0, 1] (length num_bins)
+        - 'num_bins': number of bins used
+    """
+    # Flatten all valid values
+    valid_data = normalized_frames[np.isfinite(normalized_frames)].flatten()
+    
+    # Clamp to [0, 1] for robustness
+    valid_data = np.clip(valid_data, 0.0, 1.0)
+    
+    # Compute histogram in [0, 1] range
+    hist, bin_edges = np.histogram(valid_data, bins=num_bins, range=(0.0, 1.0))
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # Compute CDF (normalized to [0, 1])
+    cdf = np.cumsum(hist).astype(np.float64)
+    if cdf[-1] > 0:
+        cdf = cdf / cdf[-1]  # Normalize to [0, 1]
+    else:
+        cdf = np.linspace(0, 1, num_bins)
+    
+    return {
+        'bin_edges': bin_edges.astype(np.float32),
+        'bin_centers': bin_centers.astype(np.float32),
+        'cdf': cdf.astype(np.float32),
+        'num_bins': num_bins
+    }
+
+
+def apply_cdf_to_normalized(
+    normalized_frame: np.ndarray,
+    cdf_mapping: Dict
+) -> np.ndarray:
+    """
+    Apply CDF mapping to an already-normalized [0,1] frame.
+    
+    This transforms the distribution of pixel values to be more uniform,
+    which can improve compression efficiency for video codecs.
+    
+    Parameters:
+    -----------
+    normalized_frame : ndarray
+        Frame with values already normalized to [0, 1]
+    cdf_mapping : dict
+        CDF mapping from compute_global_cdf_mapping()
+        
+    Returns:
+    --------
+    mapped_frame : ndarray
+        Frame with CDF-equalized values in [0, 1]
+    """
+    # Find which bin each pixel belongs to
+    bin_indices = np.digitize(normalized_frame, cdf_mapping['bin_edges'][:-1]) - 1
+    bin_indices = np.clip(bin_indices, 0, len(cdf_mapping['cdf']) - 1)
+    
+    # Handle invalid values
+    valid_mask = np.isfinite(normalized_frame)
+    mapped_frame = np.zeros_like(normalized_frame, dtype=np.float32)
+    mapped_frame[valid_mask] = cdf_mapping['cdf'][bin_indices[valid_mask]]
+    mapped_frame[~valid_mask] = 0.0  # Set invalid to 0 for compression
+    
+    return np.clip(mapped_frame, 0.0, 1.0)
+
+
+def invert_cdf_from_normalized(
+    mapped_frame: np.ndarray,
+    cdf_mapping: Dict
+) -> np.ndarray:
+    """
+    Invert CDF mapping to recover original normalized [0,1] values.
+    
+    Parameters:
+    -----------
+    mapped_frame : ndarray
+        Frame with CDF-mapped values in [0, 1]
+    cdf_mapping : dict
+        CDF mapping from compute_global_cdf_mapping()
+        
+    Returns:
+    --------
+    normalized_frame : ndarray
+        Reconstructed normalized frame with values in [0, 1]
+    """
+    valid_mask = np.isfinite(mapped_frame)
+    normalized_frame = np.zeros_like(mapped_frame, dtype=np.float32)
+    
+    # Interpolate: CDF values -> bin centers (which are the original normalized values)
+    normalized_frame[valid_mask] = np.interp(
+        mapped_frame[valid_mask],
+        cdf_mapping['cdf'],
+        cdf_mapping['bin_centers']
+    )
+    normalized_frame[~valid_mask] = 0.0
+    
+    return np.clip(normalized_frame, 0.0, 1.0)

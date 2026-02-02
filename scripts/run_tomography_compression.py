@@ -70,7 +70,7 @@ def main():
     
     # Quality settings to test (0-100, higher = better quality)
 
-    QUALITY_SETTINGS = [100, 95, 90]  # Recommended quality levels
+    QUALITY_SETTINGS = [70, 60, 50]  # Recommended quality levels
     
     # Sampling ratio for dynamic range estimation (1.0 = 100% of files)
     SAMPLE_RATIO = 1.0  # Use 10% for testing
