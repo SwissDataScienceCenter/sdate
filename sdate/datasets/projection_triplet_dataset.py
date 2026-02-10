@@ -1,11 +1,12 @@
 """
 Projection Triplet Dataset for Noise2Noise Denoising in Tomography.
 
-This dataset loads consecutive projection triplets from tomographic scans
+This dataset loads consecutive projection sequences from tomographic scans
 for training a denoising network using the Noise2Noise paradigm.
 
-The idea: given 3 consecutive projections (P_{i-1}, P_i, P_{i+1}), 
-use P_{i-1} and P_{i+1} as input to predict P_i using MSE loss.
+The idea: given k+1 consecutive projections (P_i, P_{i+1}, ..., P_{i+k}),
+use (P_i, P_{i+1}, ..., P_{i+k-1}) as input (k channels) to predict P_{i+k}
+using MSE loss. When k=2 this reduces to the original triplet formulation.
 """
 
 import os
@@ -456,9 +457,12 @@ class ProjectionTripletDataset(Dataset):
     Dataset for Noise2Noise training on tomographic projections.
     
     For each sample, returns:
-    - input: Stack of projections P_{i-1} and P_{i+1} (2 channels)
-    - target: Middle projection P_i (1 channel)
+    - input: Stack of k consecutive projections P_i, P_{i+1}, ..., P_{i+k-1} (k channels)
+    - target: Next projection P_{i+k} (1 channel)
     - center_coords: (cx, cy) coordinates of original image center in cropped/padded image
+    
+    The number of input channels k is controlled by the `num_input_projections` parameter.
+    When k=2, this is equivalent to the original triplet formulation.
     """
     
     def __init__(
@@ -472,7 +476,8 @@ class ProjectionTripletDataset(Dataset):
         preload: bool = False,
         augment: bool = False,
         verbose: bool = True,
-        use_attenuation: bool = True
+        use_attenuation: bool = True,
+        num_input_projections: int = 2
     ):
         """
         Initialize the triplet dataset.
@@ -491,11 +496,14 @@ class ProjectionTripletDataset(Dataset):
             verbose: Whether to print progress messages
             use_attenuation: If True, apply dark/flat correction and compute attenuation.
                            If False, use raw projection values (darks/flats files are still skipped).
+            num_input_projections: Number of consecutive projections to use as input channels (k).
+                                  The target will be the (k+1)-th projection. Default is 2.
         """
         self.target_size = target_size
         self.augment = augment
         self.verbose = verbose
         self.use_attenuation = use_attenuation
+        self.num_input_projections = num_input_projections
         
         # Handle single path or list of paths
         if isinstance(folder_paths, (str, Path)):
@@ -531,14 +539,16 @@ class ProjectionTripletDataset(Dataset):
         if len(self.processors) == 0:
             raise ValueError("No valid folders found!")
         
-        # Build index mapping: (global_idx) -> (processor_idx, triplet_center_idx)
+        # Build index mapping: (global_idx) -> (processor_idx, start_idx)
+        # Each window uses (num_input_projections + 1) consecutive projections:
+        #   input: [start_idx, start_idx+1, ..., start_idx+k-1]  (k channels)
+        #   target: start_idx + k
         self.index_map: List[Tuple[int, int]] = []
+        window_size = self.num_input_projections + 1  # k input + 1 target
         for proc_idx, processor in enumerate(self.processors):
-            # Each triplet uses 3 consecutive projections, so we can have
-            # (num_projections - 2) triplets per folder
-            num_triplets = processor.num_projections - 2
-            for center_idx in range(1, processor.num_projections - 1):
-                self.index_map.append((proc_idx, center_idx))
+            num_windows = processor.num_projections - self.num_input_projections
+            for start_idx in range(num_windows):
+                self.index_map.append((proc_idx, start_idx))
         
         # Compute value ranges for all processors
         for processor in self.processors:
@@ -552,7 +562,8 @@ class ProjectionTripletDataset(Dataset):
         if verbose:
             print(f"\n📊 Dataset Summary:")
             print(f"   Total folders: {len(self.processors)}")
-            print(f"   Total triplets: {len(self.index_map)}")
+            print(f"   Total samples: {len(self.index_map)}")
+            print(f"   Input projections per sample (k): {self.num_input_projections}")
             print(f"   Target size: {target_size} x {target_size}")
     
     def __len__(self) -> int:
@@ -632,84 +643,82 @@ class ProjectionTripletDataset(Dataset):
     
     def _apply_augmentation(
         self, 
-        proj_prev: np.ndarray, 
-        proj_curr: np.ndarray, 
-        proj_next: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Apply consistent augmentation to all three projections."""
+        projections: List[np.ndarray]
+    ) -> List[np.ndarray]:
+        """Apply consistent augmentation to all projections in the sequence."""
         if not self.augment:
-            return proj_prev, proj_curr, proj_next
+            return projections
         
         # Random horizontal flip
         if np.random.random() > 0.5:
-            proj_prev = np.flip(proj_prev, axis=1).copy()
-            proj_curr = np.flip(proj_curr, axis=1).copy()
-            proj_next = np.flip(proj_next, axis=1).copy()
+            projections = [np.flip(p, axis=1).copy() for p in projections]
         
         # Random vertical flip
         if np.random.random() > 0.5:
-            proj_prev = np.flip(proj_prev, axis=0).copy()
-            proj_curr = np.flip(proj_curr, axis=0).copy()
-            proj_next = np.flip(proj_next, axis=0).copy()
+            projections = [np.flip(p, axis=0).copy() for p in projections]
         
         # Random 90-degree rotation
         k = np.random.randint(0, 4)
         if k > 0:
-            proj_prev = np.rot90(proj_prev, k).copy()
-            proj_curr = np.rot90(proj_curr, k).copy()
-            proj_next = np.rot90(proj_next, k).copy()
+            projections = [np.rot90(p, k).copy() for p in projections]
         
-        return proj_prev, proj_curr, proj_next
+        return projections
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get a triplet sample.
+        Get a sample with k input projections and 1 target projection.
         
         Returns:
             Dictionary with:
-            - 'input': Tensor of shape (2, target_size, target_size)
+            - 'input': Tensor of shape (k, target_size, target_size) where k = num_input_projections
             - 'target': Tensor of shape (1, target_size, target_size)
             - 'center_coords': Tensor of shape (2,) with (cx, cy) in [0, 1]
             - 'folder_name': Name of the source folder
-            - 'projection_idx': Center projection index
+            - 'projection_idx': Target projection index (i+k)
         """
-        proc_idx, center_idx = self.index_map[idx]
+        proc_idx, start_idx = self.index_map[idx]
         processor = self.processors[proc_idx]
+        k = self.num_input_projections
         
-        # Load the three projections
-        proj_prev = processor.get_projection(center_idx - 1)
-        proj_curr = processor.get_projection(center_idx)
-        proj_next = processor.get_projection(center_idx + 1)
+        # Load k+1 consecutive projections: k inputs + 1 target
+        projections = [
+            processor.get_projection(start_idx + j)
+            for j in range(k + 1)
+        ]
         
         # Apply augmentation before cropping/padding
-        proj_prev, proj_curr, proj_next = self._apply_augmentation(
-            proj_prev, proj_curr, proj_next
-        )
+        projections = self._apply_augmentation(projections)
         
-        # Crop/pad to target size - use the SAME random crop for all three projections
+        # Crop/pad to target size - use the SAME random crop for all projections
         # First image determines the crop location
-        proj_prev_processed, _, (start_h, start_w) = self._crop_or_pad(proj_prev)
-        # Use the same crop location for the other two images
-        proj_curr_processed, center_coords, _ = self._crop_or_pad(proj_curr, start_h, start_w)
-        proj_next_processed, _, _ = self._crop_or_pad(proj_next, start_h, start_w)
+        processed = []
+        start_h, start_w = None, None
+        center_coords = None
+        for i, proj in enumerate(projections):
+            proj_processed, coords, (start_h, start_w) = self._crop_or_pad(proj, start_h, start_w)
+            processed.append(proj_processed)
+            if center_coords is None:
+                center_coords = coords
         
-        # Stack input channels (prev and next projections)
+        # Stack input channels: projections [0, 1, ..., k-1]
         input_tensor = torch.from_numpy(
-            np.stack([proj_prev_processed, proj_next_processed], axis=0)
+            np.stack(processed[:k], axis=0)
         ).float()
         
-        # Target is the middle projection
-        target_tensor = torch.from_numpy(proj_curr_processed).unsqueeze(0).float()
+        # Target is the last projection (index k)
+        target_tensor = torch.from_numpy(processed[k]).unsqueeze(0).float()
         
         # Center coordinates as tensor
         center_coords_tensor = torch.tensor(center_coords, dtype=torch.float32)
+        
+        target_proj_idx = start_idx + k
         
         return {
             'input': input_tensor,
             'target': target_tensor,
             'center_coords': center_coords_tensor,
             'folder_name': self.folder_names[proc_idx],
-            'projection_idx': center_idx
+            'projection_idx': target_proj_idx
         }
     
     def get_original_dimensions(self, idx: int) -> Tuple[int, int]:
