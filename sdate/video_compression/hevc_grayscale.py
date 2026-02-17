@@ -17,8 +17,8 @@ def encode_hevc_grayscale_10bit(
     outfile: str = "out_grayscale_10bit.mov",
     fps: int = 24,
     cq_hw: int = 90,            # VideoToolbox quality   (0–100, higher = better)
-    crf_sw: int = 0,           # libx265 CRF            (0 = lossless)
-    preset_sw: str = "slow",# libx265 speed/quality  ("ultrafast" … "placebo")
+    crf_sw: int = 14,           # libx265 CRF            (0 = lossless)
+    preset_sw: str = "veryslow",# libx265 speed/quality  ("ultrafast" … "placebo")
     tune_grain: bool = False,   # If True, add -tune grain to libx265 (better texture retention)
     force_software: bool = False, # If True, skip hardware attempt and use libx265 directly
     threads: int = 0,            # ffmpeg worker threads (0 lets ffmpeg decide)
@@ -55,8 +55,8 @@ def encode_hevc_grayscale_10bit(
     if v.min() < 0.0 or v.max() > 1.0:
         raise ValueError("values must be in the range 0–1")
 
-    # ---- 1. 0-1 float → full-range int16 (0-65535) ----
-    v16 = (v * 65535.0 + 0.5).clamp_(0, 65535).to(torch.int16).cpu().numpy()
+    # ---- 1. 0-1 float → full-range uint16 (0-65535) ----
+    v16 = (v * 65535.0 + 0.5).clamp_(0, 65535).to(torch.uint16).cpu().numpy()
 
     T, H, W = v16.shape
     print(f"📤  encoding {T} × {W}×{H} frames  (grayscale 10-bit HEVC)")
@@ -190,7 +190,7 @@ def decode_hevc_grayscale_10bit(
     T = len(raw) // frame_bytes
 
     # ---- 3. uint16 → float32 0-1 ----
-    v16 = np.frombuffer(raw, dtype=np.int16).reshape((T, H, W))
+    v16 = np.frombuffer(raw, dtype=np.uint16).reshape((T, H, W))
     vf = torch.from_numpy(v16).to(torch.float32) / 65535.0
     
     # Move to specified device if provided
@@ -242,7 +242,7 @@ def encode_hevc_rgb_10bit(
         raise ValueError("values must be in the range 0–1")
 
     # Convert to uint16 full-range per channel (rgb48le)
-    v16 = (v * 65535.0 + 0.5).clamp_(0, 65535).to(torch.int16).cpu().numpy()
+    v16 = (v * 65535.0 + 0.5).clamp_(0, 65535).to(torch.uint16).cpu().numpy()
     T, H, W, C = v16.shape  # C should be 3
     print(f"📤  encoding {T} × {W}×{H} frames  (RGB 10-bit HEVC)")
 
@@ -361,7 +361,7 @@ def decode_hevc_rgb_10bit(
         raise RuntimeError("raw dump not an integer number of frames")
     T = len(raw) // frame_bytes
 
-    v16 = np.frombuffer(raw, dtype=np.int16).reshape((T, H, W, 3))
+    v16 = np.frombuffer(raw, dtype=np.uint16).reshape((T, H, W, 3))
     vf = torch.from_numpy(v16).to(torch.float32) / 65535.0
     if device is not None:
         vf = vf.to(device)

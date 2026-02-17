@@ -13,7 +13,15 @@ setup(
     author_email="<youremail@email.com>",
     description=DESCRIPTION,
     packages=find_packages(),
-    install_requires=[],  # add any additional packages that
+    install_requires=[
+        "torch",
+        "numpy",
+        "Pillow",
+        "torch_dct",
+        "huffman",
+        "tqdm",
+        "diffusers",
+    ],
     entry_points={
         'console_scripts': [
             'chip-eval-al=chip.evaluation.active_learning:main',

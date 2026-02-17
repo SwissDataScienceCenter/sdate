@@ -1,0 +1,51 @@
+# HEIC to TIFF Translation Training Configuration
+
+# Data Configuration
+data_path: "/myhome/data/sdate/shared/compression_paper/file_3_extracted"
+output_dir: "./heic_to_tiff_outputs"
+
+# Volume Configuration
+volume_size: 64              # Size of cubic sub-volumes (64x64x64)
+stride: 32                   # Stride for sub-volume extraction (50% overlap)
+num_frames: 200              # Number of TIFF frames to load (subset for faster training)
+
+# Training Configuration
+batch_size: 2                # Batch size (smaller for 3D volumes due to memory)
+learning_rate: 1e-4          # Initial learning rate
+num_epochs: 50               # Number of training epochs
+validation_split: 0.2        # Fraction of data for validation
+
+# HEIC Configuration
+heic_quality: 50             # HEIC compression quality (0-100, higher = better)
+
+# System Configuration
+max_workers: 8               # Number of data loading workers
+mixed_precision: "fp16"      # Mixed precision training (fp16, bf16, or null)
+gradient_accumulation_steps: 2  # Steps to accumulate gradients
+max_grad_norm: 1.0          # Maximum gradient norm for clipping
+
+# Logging Configuration
+warmup_steps: 500           # Number of warmup steps for learning rate
+logging_steps: 50           # Steps between logging
+save_steps: 500             # Steps between model checkpoints
+eval_steps: 250             # Steps between validation evaluations
+seed: 42                    # Random seed for reproducibility
+
+# Weights & Biases Configuration
+use_wandb: true            # Enable W&B logging
+wandb_project: "heic-to-tiff-translation"  # W&B project name
+
+# Model Configuration (UNet3DConditionModel)
+# These are set in the code but documented here for reference:
+# - in_channels: 1 (HEIC input)
+# - out_channels: 1 (TIFF output)  
+# - block_out_channels: [64, 128, 256, 512]
+# - cross_attention_dim: 768 (for positional encoding)
+# - attention_head_dim: 64
+# - layers_per_block: 2
+
+# Loss Configuration
+# These are set in the code but documented here for reference:
+# - l1_weight: 1.0 (L1 loss weight)
+# - l2_weight: 0.5 (L2 loss weight)
+# - perceptual_weight: 0.0 (Perceptual loss weight, not implemented)

@@ -10,8 +10,3 @@ notebooks/comparison_results/*
 notebooks/streaming_output/*
 scripts/compression_analysis_output/*
 *.mov
-sdate.egg-info/top_level.txt
-sdate.egg-info/SOURCES.txt
-sdate.egg-info/PKG-INFO
-sdate.egg-info/entry_points.txt
-sdate.egg-info/dependency_links.txt
