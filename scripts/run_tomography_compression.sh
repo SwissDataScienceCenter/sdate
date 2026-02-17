@@ -27,6 +27,11 @@
 # Parse optional folder_id argument
 FOLDER_ID=${1:-}  # Empty string if not provided
 
+# Use environment variables with defaults
+QUALITY_SETTINGS=${QUALITY:-""}
+OUTPUT_PATH_ARG=${OUTPUT_PATH:-""}
+CT_FILES_BASE_PATH_ARG=${CT_FILES_BASE_PATH:-""}
+
 echo "========================================================================"
 echo "Tomographic Data Compression Pipeline"
 echo "========================================================================"
@@ -38,6 +43,14 @@ if [ -n "$FOLDER_ID" ]; then
     echo "Folder ID: $FOLDER_ID (processing file_${FOLDER_ID}_extracted only)"
 else
     echo "Folder ID: Not specified (processing all folders)"
+fi
+if [ -n "$QUALITY_SETTINGS" ]; then
+    echo "Quality settings (from env): $QUALITY_SETTINGS"
+else
+    echo "Quality settings: Using defaults from Python script"
+fi
+if [ -n "$OUTPUT_PATH_ARG" ]; then
+    echo "Output path (from env): $OUTPUT_PATH_ARG"
 fi
 echo ""
 
@@ -70,12 +83,27 @@ echo "Starting compression pipeline..."
 echo "========================================================================"
 echo ""
 
-# Build command with optional folder_id
+# Build command with optional folder_id and environment-driven parameters
+CMD="python run_tomography_compression.py"
+
 if [ -n "$FOLDER_ID" ]; then
-    python run_tomography_compression.py --folder-id "$FOLDER_ID"
-else
-    python run_tomography_compression.py
+    CMD="$CMD --folder-id $FOLDER_ID"
 fi
+
+if [ -n "$QUALITY_SETTINGS" ]; then
+    CMD="$CMD --quality $QUALITY_SETTINGS"
+fi
+
+if [ -n "$OUTPUT_PATH_ARG" ]; then
+    CMD="$CMD --output-path $OUTPUT_PATH_ARG"
+fi
+
+if [ -n "$CT_FILES_BASE_PATH_ARG" ]; then
+    CMD="$CMD --base-path $CT_FILES_BASE_PATH_ARG"
+fi
+
+echo "Running command: $CMD"
+eval $CMD
 
 # Capture exit code
 EXIT_CODE=$?

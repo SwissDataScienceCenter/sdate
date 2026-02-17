@@ -37,6 +37,8 @@ class EncoderParams:
     frame_threads: Optional[int] = None
     pools: Optional[str] = None
     extra_x265: str = ""
+    keyint: Optional[int] = None  # GOP size: 1 = all-intra (JPEG-like), None = default (~250)
+    # Note: If cq_hw > 100, lossless encoding is used (crf_sw is ignored)
 
 
 class HevcGray10Streamer:
@@ -141,31 +143,64 @@ class HevcGray10Streamer:
         # placeholders {W}x{H} are replaced on first frame when known
 
         # x265 parameters
-        base_params = ["mono=1", "no-info=1", "colorprim=bt709", "transfer=bt709", "colormatrix=bt709"]
+        # Note: mono=1 is not a valid x265 option in mainline builds
+        # gray10le pixel format already ensures monochrome output
+        base_params = ["no-info=1", "colorprim=bt709", "transfer=bt709", "colormatrix=bt709"]
+        # Use lossless encoding if quality > 100
+        if p.cq_hw > 100:
+            base_params.append("lossless=1")
         if p.frame_threads is not None:
             base_params.append(f"frame-threads={p.frame_threads}")
         if p.pools is not None:
             base_params.append(f"pools={p.pools}")
+        if p.keyint is not None:
+            base_params.append(f"keyint={p.keyint}")
+            if p.keyint == 1:
+                # For all-intra (JPEG-like), also disable B-frames and set min-keyint
+                base_params.append("min-keyint=1")
+                base_params.append("bframes=0")
         if p.extra_x265:
             base_params.append(p.extra_x265)
         x265_param_str = ":".join(base_params)
 
         sw_cmd = [
             "ffmpeg", "-y",
-            "-f", "rawvideo", "-pix_fmt", "gray16le",
-            "-s", "{W}x{H}", "-r", str(p.fps),
+            "-f", "rawvideo",
+            "-pix_fmt", "gray16le",
+            "-s", "{W}x{H}",
+            "-r", str(p.fps),
             "-i", "pipe:0",
-            "-vf", "format=yuv420p10le",
+            # convert to 10-bit grayscale for HEVC main10 builds
+            "-vf", "format=gray10le",
             "-c:v", "libx265",
-            "-profile:v", "main10",
-            "-tag:v", "hvc1",
-            "-pix_fmt", "yuv420p10le",
-            "-preset", p.preset_sw,
+            # keep it monochrome end-to-end
+            "-pix_fmt", "gray10le",
             "-crf", str(p.crf_sw),
+            "-preset", p.preset_sw,
             "-threads", str(p.threads),
             "-x265-params", x265_param_str,
-            str(outfile)
+
+            # strongly recommend MKV for monochrome HEVC interoperability
+            # "-f", "matroska",
+            str(outfile),
+
+            # "ffmpeg", "-y",
+            # "-f", "rawvideo", "-pix_fmt", "gray16le",
+            # "-s", "{W}x{H}", "-r", str(p.fps),
+            # "-i", "pipe:0",
+            # "-vf", "format=yuv420p10le",
+            # "-c:v", "libx265",
+            # "-profile:v", "main10",
+            # "-tag:v", "hvc1",
+            # "-pix_fmt", "yuv420p10le",
+            # "-preset", p.preset_sw,
+            # "-crf", str(p.crf_sw),
+            # "-threads", str(p.threads),
+            # "-x265-params", x265_param_str,
+            # str(outfile)
         ]
+
+        
 
         if p.tune_grain:
             insert_pos = sw_cmd.index("libx265") + 1

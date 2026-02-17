@@ -491,7 +491,8 @@ def stream_tomography_to_hevc(
     dark_mean: Optional[np.ndarray] = None,
     flat_mean: Optional[np.ndarray] = None,
     use_cdf_normalization: bool = False,
-    cdf_num_bins: int = 1000
+    cdf_num_bins: int = 1000,
+    keyint: Optional[int] = None
 ) -> Dict[str, any]:
     """
     Stream compress darks, flats, and projections independently to separate HEVC files.
@@ -531,6 +532,13 @@ def stream_tomography_to_hevc(
         Each frame gets its own CDF mapping which is saved for reconstruction.
     cdf_num_bins : int
         Number of bins for per-frame CDF computation (default: 1000)
+    keyint : int, optional
+        GOP (Group of Pictures) size / keyframe interval. Controls I-frame spacing:
+        - keyint=1: All-intra compression (JPEG-like, every frame is a keyframe)
+        - keyint=30: Keyframe every 30 frames (good for seeking)
+        - keyint=None: Use encoder default (~250 frames, best compression)
+    
+    Note: If quality > 100, lossless encoding is used automatically.
     
     Returns:
     --------
@@ -553,13 +561,15 @@ def stream_tomography_to_hevc(
     projection_files = tiff_files[num_darks + num_flats:num_darks + num_flats + num_projections]
     
     # Configure encoder parameters
+    # Note: If quality > 100, lossless encoding is used (crf_sw is ignored)
     encoder_params = EncoderParams(
         fps=fps,
         cq_hw=quality,
-        crf_sw=min(51, 51 - int(quality * 51 / 100)),
+        crf_sw=min(51, 51 - int(min(quality, 100) * 51 / 100)),
         preset_sw=preset_sw,
         force_software=force_software,
-        threads=0
+        threads=0,
+        keyint=keyint
     )
     
     results = {
@@ -642,7 +652,7 @@ def stream_tomography_to_hevc(
                 for frame_idx, tiff_file in enumerate(tqdm(files, desc=f"      {mode_str}", leave=False)):
                     # Load image
                     img = Image.open(tiff_file)
-                    arr = np.array(img, np.int32)
+                    arr = np.array(img).astype(np.float32)
                     
                     # Handle different formats
                     if arr.ndim == 3:
@@ -650,12 +660,13 @@ def stream_tomography_to_hevc(
                     
                     # Apply correction if enabled for projections
                     if is_attenuation_projection:
-                        arr = compute_attenuation(arr.astype(np.float32), dark_mean, flat_mean)
+                        arr = compute_attenuation(arr, dark_mean, flat_mean)
                     elif is_transmission_projection:
-                        arr = compute_transmission(arr.astype(np.float32), dark_mean, flat_mean)
+                        arr = compute_transmission(arr, dark_mean, flat_mean)
                     
                     # Convert to tensor and normalize
                     frame_tensor = torch.from_numpy(arr).float()
+                    # print(f"Processing frame {frame_idx+1}/{len(files)}: {tiff_file.name}", "with range [{:.1f}, {:.1f}]".format(frame_tensor.min().item(), frame_tensor.max().item()))
                     
                     if use_per_frame and per_frame_min is not None and per_frame_max is not None:
                         # Use per-frame percentile range for normalization
@@ -800,7 +811,8 @@ def batch_compress_tomography(
     use_transmission: bool = False,
     use_cdf_normalization: bool = False,
     cdf_num_bins: int = 1000,
-    overwrite: bool = False
+    overwrite: bool = False,
+    keyint: Optional[int] = None
 ) -> pd.DataFrame:
     """
     Batch process all tomographic TIFF sequences with independent compression.
@@ -866,6 +878,13 @@ def batch_compress_tomography(
     overwrite : bool
         If True, reprocess all folders even if results exist in CSV.
         If False (default), skip folders/quality combinations already in CSV.
+    keyint : int, optional
+        GOP (Group of Pictures) size / keyframe interval. Controls I-frame spacing:
+        - keyint=1: All-intra compression (JPEG-like, every frame is a keyframe)
+        - keyint=30: Keyframe every 30 frames (good balance)
+        - keyint=None: Use encoder default (~250 frames, best compression)
+    
+    Note: If a quality value > 100 is passed, lossless encoding is used automatically.
     
     Returns:
     --------
@@ -895,6 +914,13 @@ def batch_compress_tomography(
         print(f"📐 TRANSMISSION MODE: Compressing T = (I-dark)/(flat-dark) [unclipped]")
     if use_cdf_normalization:
         print(f"📈 PER-FRAME CDF NORMALIZATION: Enabled (bins={cdf_num_bins})")
+    if keyint is not None:
+        if keyint == 1:
+            print(f"🎞️  KEYFRAME SPACING: {keyint} (all-intra / JPEG-like)")
+        else:
+            print(f"🎞️  KEYFRAME SPACING: {keyint} frames")
+    else:
+        print(f"🎞️  KEYFRAME SPACING: auto (encoder default ~250)")
     print(f"🔄 Overwrite mode: {overwrite}")
     print()
     
@@ -1075,7 +1101,8 @@ def batch_compress_tomography(
                     dark_mean=dark_mean,
                     flat_mean=flat_mean,
                     use_cdf_normalization=use_cdf_normalization,
-                    cdf_num_bins=cdf_num_bins
+                    cdf_num_bins=cdf_num_bins,
+                    keyint=keyint
                 )
                 
                 total_compression_time = time.time() - start_time

@@ -18,6 +18,7 @@ Or customize the configuration below and run directly.
 from pathlib import Path
 import sys
 import argparse
+import os
 
 # Resolve project root based on this file's location
 CURRENT_FILE = Path(__file__).resolve()
@@ -51,26 +52,58 @@ def main():
         default=False,
         help='Overwrite existing results in CSV. If not set, skip already processed folder/quality combinations.'
     )
+    parser.add_argument(
+        '--quality',
+        type=str,
+        default=None,
+        help='Comma-separated quality settings (e.g., "70,60,50"). Overrides QUALITY environment variable.'
+    )
+    parser.add_argument(
+        '--output-path',
+        type=str,
+        default=None,
+        help='Output directory path. Overrides OUTPUT_PATH environment variable.'
+    )
+    parser.add_argument(
+        '--base-path',
+        type=str,
+        default=None,
+        help='Base path for CT files. Overrides CT_FILES_BASE_PATH environment variable.'
+    )
     args = parser.parse_args()
     
     folder_id = args.folder_id
     overwrite = args.overwrite
     
     # ========================================================================
-    # CONFIGURATION - Modify these parameters as needed
+    # CONFIGURATION - Parameters can be set via:
+    #   1. Command-line arguments (highest priority)
+    #   2. Environment variables
+    #   3. Default values below (lowest priority)
     # ========================================================================
     
     # Base path containing folders with TIFF sequences
-    CT_FILES_BASE_PATH = Path('/das/home/barbaf_l/p22274/compression_paper')
-    # CT_FILES_BASE_PATH = Path('data/ct_files')  # For testing locally
+    default_base_path = '/das/home/barbaf_l/p22274/compression_paper'
+    CT_FILES_BASE_PATH = Path(
+        args.base_path or 
+        os.environ.get('CT_FILES_BASE_PATH', default_base_path)
+    )
     
     # Output directory for compressed files and reports
-    OUTPUT_PATH = Path('/das/home/barbaf_l/p22274/compression_paper/streaming_output')
-    # OUTPUT_PATH = Path('data/streaming_output')  # For testing locally
+    default_output_path = '/das/home/barbaf_l/p22274/compression_paper/streaming_output'
+    OUTPUT_PATH = Path(
+        args.output_path or 
+        os.environ.get('OUTPUT_PATH', default_output_path)
+    )
     
     # Quality settings to test (0-100, higher = better quality)
-
-    QUALITY_SETTINGS = [70, 60, 50]  # Recommended quality levels
+    # Priority: CLI arg > env var > default
+    default_qualities = [110]
+    quality_str = args.quality or os.environ.get('QUALITY', None)
+    if quality_str:
+        QUALITY_SETTINGS = [int(q.strip()) for q in quality_str.split(',')]
+    else:
+        QUALITY_SETTINGS = default_qualities
     
     # Sampling ratio for dynamic range estimation (1.0 = 100% of files)
     SAMPLE_RATIO = 1.0  # Use 10% for testing
@@ -95,7 +128,7 @@ def main():
     # Per-frame normalization using percentiles (recommended for better quality)
     USE_PER_FRAME_PERCENTILE = True  # Set to False to use global min/max
     LOW_PERCENTILE = 0.0   # Lower percentile for per-frame normalization (default: 1st)
-    HIGH_PERCENTILE = 100  # Upper percentile for per-frame normalization (default: 99th)
+    HIGH_PERCENTILE = 100.0  # Upper percentile for per-frame normalization (default: 99th)
 
     # Correction mode settings
     # USE_ATTENUATION: Compresses μ = -ln((I-dark)/(flat-dark)) - clips transmission, may lose info
@@ -107,6 +140,16 @@ def main():
     # CDF normalization settings (per-frame histogram equalization for more uniform distribution)
     USE_CDF_NORMALIZATION = False  # Set to True to apply per-frame CDF-based histogram equalization
     CDF_NUM_BINS = 2000  # Number of bins for CDF histogram computation
+    
+    # Keyframe spacing (GOP size) settings
+    # Controls the interval between I-frames (keyframes):
+    #   - KEY_FRAME_SPACING = 1: All-intra compression (JPEG-like, every frame is a keyframe)
+    #   - KEY_FRAME_SPACING = 30: Keyframe every 30 frames (good for seeking)
+    #   - KEY_FRAME_SPACING = None: Use encoder default (~250 frames, best compression)
+    KEY_FRAME_SPACING = None  # Set to 1 for JPEG-like compression, or any integer for custom GOP
+    
+    # Note: To use lossless encoding, set a quality value > 100 (e.g., 101)
+    # Quality values 0-100 use CRF-based lossy encoding
     
     # ========================================================================
     # RUN PIPELINE
@@ -136,6 +179,19 @@ def main():
     else:
         print(f"  Correction mode: None (raw projections)")
     print(f"  CDF normalization: {'Per-frame (bins=' + str(CDF_NUM_BINS) + ')' if USE_CDF_NORMALIZATION else 'Disabled'}")
+    if KEY_FRAME_SPACING is not None:
+        if KEY_FRAME_SPACING == 1:
+            print(f"  Keyframe spacing: {KEY_FRAME_SPACING} (all-intra / JPEG-like)")
+        else:
+            print(f"  Keyframe spacing: {KEY_FRAME_SPACING} frames")
+    else:
+        print(f"  Keyframe spacing: auto (encoder default ~250)")
+    # Check if any quality setting triggers lossless mode
+    lossless_qualities = [q for q in QUALITY_SETTINGS if q > 100]
+    if lossless_qualities:
+        print(f"  Lossless encoding: Yes (quality > 100 for values: {lossless_qualities})")
+    else:
+        print(f"  Lossless encoding: No (all quality values <= 100)")
     print("\n" + "=" * 80 + "\n")
     
     # Run the pipeline
@@ -158,7 +214,8 @@ def main():
         use_transmission=USE_TRANSMISSION,
         use_cdf_normalization=USE_CDF_NORMALIZATION,
         cdf_num_bins=CDF_NUM_BINS,
-        overwrite=overwrite
+        overwrite=overwrite,
+        keyint=KEY_FRAME_SPACING
     )
     
     # Print results summary
