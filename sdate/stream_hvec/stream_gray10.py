@@ -79,7 +79,7 @@ class HevcGray10Streamer:
         self._shape: Optional[tuple[int, int]] = None  # (H, W)
         self._frame_count = 0
         self.segments: List[Path] = []
-        self._segment_open = False
+        self._segment_open = False  
 
     # ------------- segment lifecycle -------------
     def start_segment(self, q: Optional[int] = None, outfile: Optional[str | os.PathLike] = None):
