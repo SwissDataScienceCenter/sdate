@@ -24,11 +24,12 @@ import io
 import struct
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Union, TYPE_CHECKING
 from PIL import Image
 from tqdm.auto import tqdm
 
 from .predictor import BlockPredictor
+from .drift_predictor import DriftPredictor
 from .entropy import (
     ResidualEncoder,
     ResidualDecoder,
@@ -39,6 +40,9 @@ from .entropy import (
     PATCH_MODE_RESIDUAL,
     PATCH_MODE_JPEG_FALLBACK,
 )
+
+# Type alias for any predictor that exposes predict_frame()
+Predictor = Union[BlockPredictor, DriftPredictor]
 
 
 def _encode_jpeg(patch: np.ndarray, quality: int = 95) -> bytes:
@@ -86,7 +90,7 @@ class CTCompressor:
 
     def __init__(
         self,
-        predictor: BlockPredictor,
+        predictor: "Predictor",
         patch_size: int = 256,
         residual_quality: int = 80,
         jpeg_quality: int = 95,

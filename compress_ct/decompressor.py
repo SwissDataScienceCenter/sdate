@@ -9,11 +9,12 @@ import io
 import struct
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Union, TYPE_CHECKING
 from PIL import Image
 from tqdm.auto import tqdm
 
 from .predictor import BlockPredictor
+from .drift_predictor import DriftPredictor
 from .entropy import (
     ResidualDecoder,
     MAGIC,
@@ -23,6 +24,9 @@ from .entropy import (
     PATCH_MODE_RESIDUAL,
     PATCH_MODE_JPEG_FALLBACK,
 )
+
+# Type alias for any predictor that exposes predict_frame()
+Predictor = Union[BlockPredictor, DriftPredictor]
 
 
 def _decode_jpeg(blob: bytes) -> np.ndarray:
@@ -46,7 +50,7 @@ class CTDecompressor:
 
     def __init__(
         self,
-        predictor: BlockPredictor,
+        predictor: "Predictor",
         verbose: bool = True,
     ):
         self.predictor = predictor

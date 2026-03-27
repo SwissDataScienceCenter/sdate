@@ -26,17 +26,34 @@ class Noise2NoiseLoss(BaseLoss):
     Loss function for Noise2Noise training on tomographic projections.
     
     The model takes two noisy observations (P_{i-1}, P_{i+1}) and predicts
-    a denoised version of P_i. We use MSE loss between the prediction and P_i.
+    a denoised version of P_i.
     
-    Optionally includes perceptual loss and gradient-based losses.
+    Implements the combined loss function:
+        L = λ₁||I - Î||₁ + λ_g||∇I - ∇Î||₁ + λ_r·ProxyRate(r)
+    
+    where:
+        - I and Î are the target and predicted frames respectively
+        - ||·||₁ denotes L1 norm
+        - ∇ represents spatial gradients (computed via Sobel filters)
+        - r = I - Î is the residual
+        - ProxyRate(r) = Σ log(ε + |r|) is a proxy for compression rate
+    
+    The three terms encourage:
+        1. L1 loss: Direct pixel-wise accuracy
+        2. Gradient loss: Preservation of edges and fine details
+        3. Proxy rate: Implicit compression efficiency via residual sparsity
     """
     
     def __init__(
         self,
         device: torch.device,
-        use_l1: bool = False,
-        use_gradient_loss: bool = False,
-        gradient_weight: float = 0.1,
+        use_l1: bool = True,
+        lambda_l1: float = 1.0,
+        use_gradient_loss: bool = True,
+        lambda_gradient: float = 0.1,
+        use_proxy_rate: bool = True,
+        lambda_rate: float = 0.01,
+        proxy_rate_epsilon: float = 1e-6,
         use_ssim_loss: bool = False,
         ssim_weight: float = 0.1
     ):
@@ -45,15 +62,21 @@ class Noise2NoiseLoss(BaseLoss):
         
         Args:
             device: Torch device for computation
-            use_l1: If True, use L1 loss instead of MSE
-            use_gradient_loss: If True, add gradient consistency loss
-            gradient_weight: Weight for gradient loss
+            use_l1: If True, use L1 loss (default: True)
+            lambda_l1: Weight for L1 loss
+            use_gradient_loss: If True, add gradient consistency loss (default: True)
+            lambda_gradient: Weight for gradient loss
+            use_proxy_rate: If True, add proxy rate term (default: True)
+            lambda_rate: Weight for proxy rate loss
+            proxy_rate_epsilon: Epsilon for log stability in proxy rate
             use_ssim_loss: If True, add SSIM loss
             ssim_weight: Weight for SSIM loss
         """
-        stats_names = ["loss", "mse_loss"]
+        stats_names = ["loss", "l1_loss"]
         if use_gradient_loss:
             stats_names.append("gradient_loss")
+        if use_proxy_rate:
+            stats_names.append("proxy_rate_loss")
         if use_ssim_loss:
             stats_names.append("ssim_loss")
         
@@ -61,21 +84,27 @@ class Noise2NoiseLoss(BaseLoss):
         
         self.device = device
         self.use_l1 = use_l1
+        self.lambda_l1 = lambda_l1
         self.use_gradient_loss = use_gradient_loss
-        self.gradient_weight = gradient_weight
+        self.lambda_gradient = lambda_gradient
+        self.use_proxy_rate = use_proxy_rate
+        self.lambda_rate = lambda_rate
+        self.proxy_rate_epsilon = proxy_rate_epsilon
         self.use_ssim_loss = use_ssim_loss
         self.ssim_weight = ssim_weight
         
         # Loss functions
-        self.mse = nn.MSELoss()
-        self.l1 = nn.L1Loss()
+        self.l1 = nn.L1Loss(reduction='mean')
     
     def _compute_gradient_loss(
         self, 
         pred: torch.Tensor, 
         target: torch.Tensor
     ) -> torch.Tensor:
-        """Compute gradient consistency loss."""
+        """
+        Compute gradient consistency loss using L1 norm.
+        Computes ||∇I - ∇Î||_1 where ∇ is the spatial gradient.
+        """
         # Sobel filters for gradient computation
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
                                dtype=torch.float32, device=self.device).view(1, 1, 3, 3)
@@ -88,9 +117,29 @@ class Noise2NoiseLoss(BaseLoss):
         target_grad_x = nn.functional.conv2d(target, sobel_x, padding=1)
         target_grad_y = nn.functional.conv2d(target, sobel_y, padding=1)
         
-        # MSE on gradients
-        grad_loss = self.mse(pred_grad_x, target_grad_x) + self.mse(pred_grad_y, target_grad_y)
+        # L1 loss on gradients
+        grad_loss = self.l1(pred_grad_x, target_grad_x) + self.l1(pred_grad_y, target_grad_y)
         return grad_loss
+    
+    def _compute_proxy_rate(
+        self,
+        residual: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute proxy rate loss: ProxyRate(r) = Σ log(ε + |r|)
+        where r is the residual (target - predicted).
+        
+        Args:
+            residual: The residual tensor (I - Î)
+            
+        Returns:
+            Scalar tensor representing the proxy rate
+        """
+        # Compute log(epsilon + |r|) and sum over all elements
+        proxy_rate = torch.log(self.proxy_rate_epsilon + torch.abs(residual)).sum()
+        # Normalize by the number of elements for stability
+        proxy_rate = proxy_rate / residual.numel()
+        return proxy_rate
     
     def _compute_ssim(
         self, 
@@ -136,7 +185,14 @@ class Noise2NoiseLoss(BaseLoss):
         model: nn.Module
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Compute the Noise2Noise loss.
+        Compute the combined loss:
+        L = λ₁||I - Î||₁ + λ_g||∇I - ∇Î||₁ + λ_r·ProxyRate(r)
+        
+        where:
+        - I is the target frame
+        - Î is the predicted frame
+        - r = I - Î is the residual
+        - ProxyRate(r) = Σ log(ε + |r|)
         
         Args:
             instance: Dictionary with 'input', 'target', 'center_coords' keys
@@ -151,152 +207,47 @@ class Noise2NoiseLoss(BaseLoss):
         center_coords = instance['center_coords'].to(self.device)  # (B, 2)
         
         # Forward pass through model
-        # The UNet2DModel expects timestep argument - we use 0 for non-diffusion models
-        # or we can ignore it if not using diffusion
         model.zero_grad()
         
         # Check if model expects timestep (diffusers UNet)
         try:
-            # For diffusers UNet2DModel, we need a dummy timestep
-            # We use 0 as we're not doing diffusion
-            batch_size = input_tensor.shape[0]
-            timesteps = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-            pred = model(input_tensor, timesteps, return_dict=False)[0]
+            conditioning = center_coords[:, 0].long()  # Use the first coordinate as timestep to condition on the x position
+            pred = model(input_tensor, conditioning, return_dict=False)[0]
         except TypeError:
             # For regular UNet without timestep
             pred = model(input_tensor)
         
-        # Compute main loss
+        # Compute residual for proxy rate term
+        residual = target - pred
+        
+        # Initialize total loss
+        total_loss = torch.tensor(0.0, device=self.device)
+        loss_dict = {}
+        
+        # 1. L1 loss: λ₁||I - Î||₁
         if self.use_l1:
-            mse_loss = self.l1(pred, target)
-        else:
-            mse_loss = self.mse(pred, target)
+            l1_loss = self.l1(pred, target)
+            total_loss = total_loss + self.lambda_l1 * l1_loss
+            loss_dict["l1_loss"] = l1_loss
         
-        total_loss = mse_loss
-        loss_dict = {"loss": total_loss, "mse_loss": mse_loss}
-        
-        # Optional gradient loss
+        # 2. Gradient loss: λ_g||∇I - ∇Î||₁
         if self.use_gradient_loss:
             grad_loss = self._compute_gradient_loss(pred, target)
-            total_loss = total_loss + self.gradient_weight * grad_loss
+            total_loss = total_loss + self.lambda_gradient * grad_loss
             loss_dict["gradient_loss"] = grad_loss
-            loss_dict["loss"] = total_loss
         
-        # Optional SSIM loss
+        # 3. Proxy rate loss: λ_r·ProxyRate(r)
+        if self.use_proxy_rate:
+            proxy_rate_loss = self._compute_proxy_rate(residual)
+            total_loss = total_loss + self.lambda_rate * proxy_rate_loss
+            loss_dict["proxy_rate_loss"] = proxy_rate_loss
+        
+        # 4. Optional SSIM loss (legacy support)
         if self.use_ssim_loss:
             ssim_loss = self._compute_ssim(pred, target)
             total_loss = total_loss + self.ssim_weight * ssim_loss
             loss_dict["ssim_loss"] = ssim_loss
-            loss_dict["loss"] = total_loss
+        
+        loss_dict["loss"] = total_loss
         
         return total_loss, loss_dict
-
-
-class Noise2NoiseWithConditioningLoss(Noise2NoiseLoss):
-    """
-    Extended Noise2Noise loss that passes center coordinates as conditioning to the model.
-    
-    This version embeds the center coordinates and concatenates them with the input
-    or uses class conditioning if the model supports it.
-    """
-    
-    def __init__(
-        self,
-        device: torch.device,
-        conditioning_method: str = "concat_embedding",
-        embedding_dim: int = 256,
-        **kwargs
-    ):
-        """
-        Initialize the conditioned loss function.
-        
-        Args:
-            device: Torch device
-            conditioning_method: One of "concat_embedding", "class_embedding", "none"
-            embedding_dim: Dimension of coordinate embedding
-            **kwargs: Additional arguments for parent class
-        """
-        super().__init__(device=device, **kwargs)
-        
-        self.conditioning_method = conditioning_method
-        self.embedding_dim = embedding_dim
-        
-        # Coordinate embedding network (simple MLP)
-        if conditioning_method == "concat_embedding":
-            self.coord_embedding = nn.Sequential(
-                nn.Linear(2, embedding_dim),
-                nn.SiLU(),
-                nn.Linear(embedding_dim, embedding_dim)
-            ).to(device)
-    
-    def compute_loss(
-        self, 
-        instance: Dict[str, torch.Tensor], 
-        model: nn.Module
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Compute the conditioned Noise2Noise loss.
-        """
-        input_tensor = instance['input'].to(self.device)
-        target = instance['target'].to(self.device)
-        center_coords = instance['center_coords'].to(self.device)
-        
-        model.zero_grad()
-        
-        conditioning = center_coords[:, 0].to(self.device)
-        
-        pred = model(input_tensor, conditioning, return_dict=False)[0]
-            
-        
-        # Compute losses (same as parent)
-        if self.use_l1:
-            mse_loss = self.l1(pred, target)
-        else:
-            mse_loss = self.mse(pred, target)
-        
-        total_loss = mse_loss
-        loss_dict = {"loss": total_loss, "mse_loss": mse_loss}
-        
-        if self.use_gradient_loss:
-            grad_loss = self._compute_gradient_loss(pred, target)
-            total_loss = total_loss + self.gradient_weight * grad_loss
-            loss_dict["gradient_loss"] = grad_loss
-            loss_dict["loss"] = total_loss
-        
-        if self.use_ssim_loss:
-            ssim_loss = self._compute_ssim(pred, target)
-            total_loss = total_loss + self.ssim_weight * ssim_loss
-            loss_dict["ssim_loss"] = ssim_loss
-            loss_dict["loss"] = total_loss
-        
-        return total_loss, loss_dict
-
-
-# Simple loss function for use without pytorch_base
-def noise2noise_mse_loss(
-    model: nn.Module,
-    input_tensor: torch.Tensor,
-    target: torch.Tensor,
-    device: torch.device
-) -> torch.Tensor:
-    """
-    Simple MSE loss for Noise2Noise training.
-    
-    Args:
-        model: UNet2DModel
-        input_tensor: Input with shape (B, 2, H, W)
-        target: Target with shape (B, 1, H, W)
-        device: Torch device
-        
-    Returns:
-        MSE loss
-    """
-    input_tensor = input_tensor.to(device)
-    target = target.to(device)
-    
-    batch_size = input_tensor.shape[0]
-    timesteps = torch.zeros(batch_size, dtype=torch.long, device=device)
-    
-    pred = model(input_tensor, timesteps, return_dict=False)[0]
-    
-    return nn.functional.mse_loss(pred, target)

@@ -294,6 +294,7 @@ class TomographyFolderProcessor:
             darks.append(arr)
         darks = np.stack(darks, axis=0)
         self._dark_avg = np.median(darks, axis=0)
+        self._dark_first = darks[0]  # For potential debugging/analysis
         del darks
         
         # Load flat images
@@ -307,6 +308,7 @@ class TomographyFolderProcessor:
             flats.append(arr)
         flats = np.stack(flats, axis=0)
         self._flat_avg = np.median(flats, axis=0)
+        self._flat_first = flats[len(flats) // 2] # For potential debugging/analysis
         del flats
         
         # Precompute denominator

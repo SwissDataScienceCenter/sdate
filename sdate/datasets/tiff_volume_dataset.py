@@ -50,18 +50,23 @@ class TiffVolumeDataset(Dataset):
         heic_quality (int): HEIC compression quality (0-100, higher = better). Default: 85.
         heic_subfolder (str): Name of subfolder for HEIC files. Default: 'heic'.
         dual_channel (bool): Whether to return dual-channel data (TIFF + HEIC). Default: True when use_heic_compression=True.
+        use_residuals (bool): Whether to load and include residuals as a third channel. Default: False.
+        residuals_path (str, optional): Path to residuals .npy file. Required if use_residuals=True.
         
     Attributes:
         volume (torch.Tensor): The full 3D volume. Shape depends on dual_channel:
                               - Single channel: (NUM_FRAMES, Height, Width)  
                               - Dual channel: (NUM_FRAMES, 2, Height, Width) where dim 1 is [TIFF, HEIC]
         volume_indices (list): List of (d_start, h_start, w_start) tuples for each sub-volume.
+        residuals (np.ndarray, optional): Memory-mapped residuals array of shape (num_subvolumes, volume_size, volume_size, volume_size).
+        residuals_positions (np.ndarray, optional): Position indices for residuals array of shape (num_subvolumes, 3).
         
     Returns:
         __getitem__ returns a tuple of (sub_volume, indices_info) where:
         - sub_volume: torch.Tensor of shape:
                      - Single channel: (volume_size, volume_size, volume_size)
                      - Dual channel: (2, volume_size, volume_size, volume_size) where dim 0 is [TIFF, HEIC]
+                     - With residuals: (3, volume_size, volume_size, volume_size) where dim 0 is [TIFF, HEIC, RESIDUAL]
         - indices_info: Dict with position, shape, and metadata information
         
     Example:
@@ -94,6 +99,8 @@ class TiffVolumeDataset(Dataset):
         heic_quality: int = 85,
         heic_subfolder: str = 'heic',
         dual_channel: Optional[bool] = None,
+        use_residuals: bool = False,
+        residuals_path: Optional[Union[str, Path]] = None,
     ):
         super().__init__()
         
@@ -115,6 +122,22 @@ class TiffVolumeDataset(Dataset):
         self.heic_subfolder = heic_subfolder
         self.dual_channel = dual_channel if dual_channel is not None else use_heic_compression
         self.heic_path = self.data_path / self.heic_subfolder
+        
+        # Residuals parameters
+        self.use_residuals = use_residuals
+        self.residuals_path = Path(residuals_path) if residuals_path else None
+        self.residuals = None
+        self.residuals_positions = None
+        
+        # Validate residuals configuration
+        if self.use_residuals:
+            if not self.residuals_path:
+                raise ValueError("residuals_path must be provided when use_residuals=True")
+            if not self.residuals_path.exists():
+                raise ValueError(f"Residuals file not found: {self.residuals_path}")
+            if not self.dual_channel:
+                raise ValueError("use_residuals=True requires dual_channel=True (need HEIC channel)")
+
         
         # Validate HEIC availability
         if self.use_heic_compression and not HEIC_AVAILABLE:
@@ -140,12 +163,64 @@ class TiffVolumeDataset(Dataset):
         # Calculate sub-volume indices
         self.volume_indices = self._calculate_volume_indices()
         
+        # Load residuals if requested
+        if self.use_residuals:
+            self._load_residuals()
+
+        
         print(f"Created TiffVolumeDataset:")
         print(f"  Volume shape: {self.volume.shape}")
         print(f"  Sub-volume size: {self.volume_size}x{self.volume_size}x{self.volume_size}")
         print(f"  Stride: {self.stride}")
         print(f"  Number of sub-volumes: {len(self.volume_indices)}")
         print(f"  Dataset length: {len(self)}")
+        if self.use_residuals:
+            print(f"  Residuals loaded: shape={self.residuals.shape}")
+    
+    def _load_residuals(self):
+        """Load residuals from disk using memory-mapping for efficiency."""
+        print(f"Loading residuals from {self.residuals_path}")
+        
+        # Load residuals (memory-mapped for efficiency)
+        self.residuals = np.load(self.residuals_path, mmap_mode='r')
+        
+        # Load positions
+        positions_file = str(self.residuals_path).replace('_residuals.npy', '_positions.npy')
+        if Path(positions_file).exists():
+            self.residuals_positions = np.load(positions_file)
+        else:
+            raise ValueError(f"Residuals positions file not found: {positions_file}")
+        
+        # Load and validate metadata
+        metadata_file = str(self.residuals_path).replace('_residuals.npy', '_metadata.npz')
+        if Path(metadata_file).exists():
+            metadata = np.load(metadata_file)
+            
+            # Validate compatibility
+            if metadata['volume_size'] != self.volume_size:
+                raise ValueError(
+                    f"Residuals volume_size ({metadata['volume_size']}) does not match "
+                    f"dataset volume_size ({self.volume_size})"
+                )
+            if metadata['stride'] != self.stride:
+                print(f"Warning: Residuals stride ({metadata['stride']}) differs from dataset stride ({self.stride})")
+            if metadata['num_frames'] != self.num_frames:
+                raise ValueError(
+                    f"Residuals num_frames ({metadata['num_frames']}) does not match "
+                    f"dataset num_frames ({self.num_frames})"
+                )
+        
+        # Validate shapes
+        expected_num_subvolumes = len(self.volume_indices)
+        if self.residuals.shape[0] != expected_num_subvolumes:
+            raise ValueError(
+                f"Number of residual sub-volumes ({self.residuals.shape[0]}) does not match "
+                f"expected number ({expected_num_subvolumes})"
+            )
+        
+        print(f"  Residuals shape: {self.residuals.shape}")
+        print(f"  Residuals range: [{self.residuals.min():.4f}, {self.residuals.max():.4f}]")
+        print(f"  Residuals mean: {self.residuals.mean():.4f}, std: {self.residuals.std():.4f}")
         
     def _load_volume(self) -> Tuple[torch.Tensor, float, float]:
         """
@@ -424,7 +499,10 @@ class TiffVolumeDataset(Dataset):
             
         Returns:
             Tuple of (sub_volume, indices) where:
-            - sub_volume: torch.Tensor of shape (C, D, H, W) where C=1 for single-channel, C=2 for dual-channel
+            - sub_volume: torch.Tensor of shape (C, D, H, W) where:
+                         C=1 for single-channel
+                         C=2 for dual-channel (TIFF, HEIC)
+                         C=3 with residuals (TIFF, HEIC, RESIDUAL)
             - indices: torch.Tensor of shape (3,) containing [d_start, h_start, w_start]
         """
         if idx < 0 or idx >= len(self):
@@ -453,6 +531,16 @@ class TiffVolumeDataset(Dataset):
             ].clone()
             # Add channel dimension: (D, H, W) -> (1, D, H, W)
             sub_volume = sub_volume.unsqueeze(0)
+        
+        # Add residuals as third channel if available
+        if self.use_residuals:
+            # Load residual for this sub-volume from memory-mapped array
+            residual = self.residuals[idx]  # Shape: (D, H, W)
+            residual_tensor = torch.from_numpy(residual.copy()).to(self.dtype)
+            residual_tensor = residual_tensor.unsqueeze(0)  # Shape: (1, D, H, W)
+            
+            # Concatenate: (2, D, H, W) + (1, D, H, W) -> (3, D, H, W)
+            sub_volume = torch.cat([sub_volume, residual_tensor], dim=0)
         
         # Apply clipping if specified
         if self.clip_range is not None:
