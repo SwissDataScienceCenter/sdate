@@ -261,6 +261,7 @@ class ProjectionVolumeDataset(Dataset):
         num_projections: Optional[int] = None,
         target_size: Optional[int] = None,
         batch_size: int = 65536,
+        use_attenuation: bool = False,
         n_batches: int = 1000,
         normalize_values: bool = True,
         start_projection: int = 0,
@@ -276,6 +277,7 @@ class ProjectionVolumeDataset(Dataset):
             n_batches: Number of batches per epoch
             normalize_values: Whether to normalize values to [0, 1]
             start_projection: Index of first projection to load
+            use_attenuation: Whether to use attenuation correction when loading projections
             cache_volume: Whether to cache the full volume in memory
             verbose: Print loading progress
         """
@@ -306,7 +308,7 @@ class ProjectionVolumeDataset(Dataset):
             num_flats=None,  # Auto-detect
             cache_in_memory=False,
             verbose=verbose,
-            use_attenuation=False,
+            use_attenuation=use_attenuation,
         )
         
         # Determine number of projections to load

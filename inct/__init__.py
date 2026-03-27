@@ -14,7 +14,14 @@ tomographic projections using multi-resolution hash encoding.
 from .hash_encoding import HashEncoding, MultiResolutionHashEncoding
 from .model import InstantNGPModel, TinyMLP
 from .dataset import VoxelDataset, BatchVoxelDataset, ProjectionVolumeDataset, RandomCoordDataset, TensorVolumeDataset
+from .dataset_slices import ProjectionSliceDataset, TensorSliceDataset
+from .dataset_chunked import ChunkedProjectionDataset, ChunkedSliceDataset, create_zarr_from_projections, load_zarr_metadata
 from .trainer import Trainer, TrainingConfig
+from .naf import NeuralAttenuationField, NAFTrainer, ParallelBeamGeometry, DifferentiableRayTracer, create_sinogram_dataset, ParallelBeamGeometry3D, DifferentiableRayTracer3D, NAFTrainer3D
+
+# Aliases for backward compatibility
+SliceDataset = ProjectionSliceDataset
+BatchSliceDataset = TensorSliceDataset
 from .utils import psnr, mse, normalize_coords, denormalize_coords
 
 __version__ = "0.1.0"
@@ -26,7 +33,13 @@ __all__ = [
     "VoxelDataset",
     "BatchVoxelDataset",
     "ProjectionVolumeDataset",
+    "ProjectionSliceDataset",
     "TensorVolumeDataset",
+    "TensorSliceDataset",
+    "ChunkedProjectionDataset",
+    "ChunkedSliceDataset",
+    "create_zarr_from_projections",
+    "load_zarr_metadata",
     "RandomCoordDataset",
     "Trainer",
     "TrainingConfig",
@@ -34,4 +47,13 @@ __all__ = [
     "mse",
     "normalize_coords",
     "denormalize_coords",
+    # Neural Attenuation Field
+    "NeuralAttenuationField",
+    "NAFTrainer",
+    "ParallelBeamGeometry",
+    "DifferentiableRayTracer",
+    "create_sinogram_dataset",
+    # Backward compatibility aliases
+    "SliceDataset",
+    "BatchSliceDataset",
 ]
