@@ -159,8 +159,24 @@ def reconstruct_from_delta(
 def build_codebook(
     deltas: np.ndarray,
     cfg: CodebookConfig | None = None,
+    init_centroids: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, StandardScaler]:
     """Run K-means on standardised deltas.
+
+    Parameters
+    ----------
+    deltas : ndarray [N, 14]
+        Per-Gaussian delta vectors.
+    cfg : CodebookConfig | None
+        K-means hyperparameters.
+    init_centroids : ndarray [K, 14] | None
+        Optional warm-start centroids in *original* (unscaled) delta space,
+        e.g. the centroids returned by the previous frame's ``build_codebook``
+        call.  When provided the new frame's scaler re-scales them before
+        passing to K-means, and ``n_init`` is forced to 1 (sklearn requirement
+        when ``init`` is an array).  This encourages cluster assignments to
+        stay ordered across frames, which is key for entropy-coding the
+        sorted label sequence.
 
     Returns
     -------
@@ -174,15 +190,29 @@ def build_codebook(
     scaler = StandardScaler()
     scaled = scaler.fit_transform(deltas)
 
-    km = MiniBatchKMeans(
-        n_clusters=cfg.n_clusters,
-        init="k-means++",
-        n_init=cfg.kmeans_n_init,
-        max_iter=cfg.kmeans_max_iter,
-        batch_size=min(cfg.kmeans_batch_size, len(deltas)),
-        random_state=cfg.seed,
-        verbose=0,
-    )
+    if init_centroids is not None:
+        # Re-scale previous-frame centroids into the current frame's
+        # standardised space and use them as the K-means starting point.
+        scaled_init = scaler.transform(init_centroids)
+        km = MiniBatchKMeans(
+            n_clusters=cfg.n_clusters,
+            init=scaled_init,
+            n_init=1,            # required when init is an array
+            max_iter=cfg.kmeans_max_iter,
+            batch_size=min(cfg.kmeans_batch_size, len(deltas)),
+            random_state=cfg.seed,
+            verbose=0,
+        )
+    else:
+        km = MiniBatchKMeans(
+            n_clusters=cfg.n_clusters,
+            init="k-means++",
+            n_init=cfg.kmeans_n_init,
+            max_iter=cfg.kmeans_max_iter,
+            batch_size=min(cfg.kmeans_batch_size, len(deltas)),
+            random_state=cfg.seed,
+            verbose=0,
+        )
     km.fit(scaled)
 
     centroids = scaler.inverse_transform(km.cluster_centers_)

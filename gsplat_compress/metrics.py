@@ -22,13 +22,16 @@ from gsplat_compress.compression import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 def psnr(prediction: np.ndarray, target: np.ndarray) -> float:
-    """Peak signal-to-noise ratio (dB) for images in [0, 1]."""
-    mse = float(np.mean((np.clip(prediction, 0, 1) - target) ** 2))
-    return -10 * math.log10(mse + 1e-10)
+    """Peak signal-to-noise ratio (dB)."""
+    data_range = float(target.max() - target.min())
+    mse = float(np.mean((np.clip(prediction, target.min(), target.max()) - target) ** 2))
+    return 10 * math.log10(data_range ** 2 / (mse + 1e-10))
 
 
-def ssim(prediction: np.ndarray, target: np.ndarray, data_range: float = 1.0) -> float:
+def ssim(prediction: np.ndarray, target: np.ndarray, data_range: float = None) -> float:
     """Structural similarity index."""
+    if data_range is None:
+        data_range = float(target.max() - target.min())
     return float(_ssim(target, np.clip(prediction, 0, 1), data_range=data_range))
 
 

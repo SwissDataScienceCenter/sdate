@@ -23,6 +23,14 @@ from gsplat_compress.initialize import GaussianParams, init_gaussians
 from gsplat_compress.camera import ortho_camera
 from gsplat_compress.renderer import render
 
+# ── Initialisation strategies ─────────────────────────────────────────────
+from gsplat_compress.initializations import (
+    uniform_2d,
+    intensity_2d,
+    multiresolution_residual_2d,
+    uniform_3d,
+)
+
 # ── Training ──────────────────────────────────────────────────────────────
 from gsplat_compress.training import (
     TrainConfig,
@@ -73,11 +81,17 @@ from gsplat_compress.video import (
 )
 
 __all__ = [
-    # Types
+    # Core types + convenience init
     "GaussianParams",
     "init_gaussians",
     "ortho_camera",
     "render",
+    # Initialisation strategies (2-D)
+    "uniform_2d",
+    "intensity_2d",
+    "multiresolution_residual_2d",
+    # Initialisation strategies (3-D)
+    "uniform_3d",
     # Training
     "TrainConfig",
     "FinetuneConfig",
