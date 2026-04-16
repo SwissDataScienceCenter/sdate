@@ -7,7 +7,10 @@ to voxels without loading the entire volume into memory.
 
 import torch
 import numpy as np
-import zarr
+try:
+    import zarr
+except:
+    print("zarr not installed")
 from torch.utils.data import Dataset
 from pathlib import Path
 from typing import Optional, Union, Dict, Tuple
