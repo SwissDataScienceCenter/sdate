@@ -15,3 +15,6 @@ sdate.egg-info/SOURCES.txt
 sdate.egg-info/PKG-INFO
 sdate.egg-info/entry_points.txt
 sdate.egg-info/dependency_links.txt
+*.err
+*.out
+*.csv
