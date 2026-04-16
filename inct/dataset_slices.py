@@ -15,7 +15,12 @@ from typing import Optional, Union, Dict
 class ProjectionSliceDataset(Dataset):
     """
     Dataset for loading projection volumes that samples entire slices.
+    """
+    Dataset for loading projection volumes that samples entire slices.
 
+    Unlike ProjectionVolumeDataset which samples random voxels uniformly,
+    this dataset samples entire slices (projections) uniformly at random,
+    returning all voxels from the selected slices.
     Unlike ProjectionVolumeDataset which samples random voxels uniformly,
     this dataset samples entire slices (projections) uniformly at random,
     returning all voxels from the selected slices.
@@ -24,7 +29,14 @@ class ProjectionSliceDataset(Dataset):
     - Dimension 0: Height
     - Dimension 1: Width  
     - Dimension 2: Projection index (slice dimension)
+    Creates a 3D volume from projection images:
+    - Dimension 0: Height
+    - Dimension 1: Width  
+    - Dimension 2: Projection index (slice dimension)
 
+    When __getitem__ is called, instead of returning a batch of random voxels,
+    it returns all voxels from one or more randomly sampled slices.
+    """
     When __getitem__ is called, instead of returning a batch of random voxels,
     it returns all voxels from one or more randomly sampled slices.
     """
