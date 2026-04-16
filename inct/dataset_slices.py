@@ -15,8 +15,6 @@ from typing import Optional, Union, Dict
 class ProjectionSliceDataset(Dataset):
     """
     Dataset for loading projection volumes that samples entire slices.
-    """
-    Dataset for loading projection volumes that samples entire slices.
 
     Unlike ProjectionVolumeDataset which samples random voxels uniformly,
     this dataset samples entire slices (projections) uniformly at random,
@@ -34,9 +32,6 @@ class ProjectionSliceDataset(Dataset):
     - Dimension 1: Width  
     - Dimension 2: Projection index (slice dimension)
 
-    When __getitem__ is called, instead of returning a batch of random voxels,
-    it returns all voxels from one or more randomly sampled slices.
-    """
     When __getitem__ is called, instead of returning a batch of random voxels,
     it returns all voxels from one or more randomly sampled slices.
     """
@@ -448,27 +443,27 @@ class ProjectionSliceDataset(Dataset):
             self._load_volume()
         return self.volume
 
-    def get_slice(self, dim: int, idx: int) -> torch.Tensor:
-        """Get a 2D slice along a dimension."""
-        if self.volume is None:
-            if dim == 2:
-                # Can load on demand for projection dimension
-                proj_idx = self.start_projection + idx
-                proj = self.processor.get_projection(proj_idx, normalize=False)
-                if self.target_size is not None:
-                    proj = self._resize_projection(proj)
-                return torch.from_numpy(proj).float()
-            else:
-                self._load_volume()
-    
-        if dim == 0:
-            return self.volume[idx, :, :]
-        elif dim == 1:
-            return self.volume[:, idx, :]
-        elif dim == 2:
-            return self.volume[:, :, idx]
+def get_slice(self, dim: int, idx: int) -> torch.Tensor:
+    """Get a 2D slice along a dimension."""
+    if self.volume is None:
+        if dim == 2:
+            # Can load on demand for projection dimension
+            proj_idx = self.start_projection + idx
+            proj = self.processor.get_projection(proj_idx, normalize=False)
+            if self.target_size is not None:
+                proj = self._resize_projection(proj)
+            return torch.from_numpy(proj).float()
         else:
-            raise ValueError(f"Invalid dimension: {dim}")
+            self._load_volume()
+    
+    if dim == 0:
+        return self.volume[idx, :, :]
+    elif dim == 1:
+        return self.volume[:, idx, :]
+    elif dim == 2:
+        return self.volume[:, :, idx]
+    else:
+        raise ValueError(f"Invalid dimension: {dim}")
 
     def get_batch_size(self) -> int:
         """Return the effective batch size (voxels per __getitem__ call)."""
