@@ -175,6 +175,7 @@ class HevcGray10Streamer:
             "-c:v", "libx265",
             # keep it monochrome end-to-end
             "-pix_fmt", "gray10le",
+            "-tag:v", "hvc1",
             "-crf", str(p.crf_sw),
             "-preset", p.preset_sw,
             "-threads", str(p.threads),

@@ -14,3 +14,5 @@ scripts/compression_analysis_output/*
 wandb/*
 *.pt
 *.csv
+*.err
+*.out
