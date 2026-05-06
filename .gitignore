@@ -10,3 +10,7 @@ notebooks/comparison_results/*
 notebooks/streaming_output/*
 scripts/compression_analysis_output/*
 *.mov
+*.json
+wandb/*
+*.pt
+*.csv
