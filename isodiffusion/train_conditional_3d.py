@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Train a 3D conditional DDPM for fixed-direction missing-wedge recovery.
 
+python /myhome/sdate/isodiffusion/train_conditional_3d.py --data_path /myhome/data/sdate/shared/compression_paper/file_1_extracted/reconstruction/la_fourier_1.npy --cone_width_deg 72 --patch_size 167 --volume_size 96 --batch_size 1 --epochs 300 --exp_name f1_3d --wandb --load_checkpoint=/myhome/sdate/checkpoints/ddpm_isodiffusion_f1_3d.pt
+
 The model receives ``concat(x_t, carved_x)`` as two input channels and predicts
 the noise added to the clean target patch ``x``.  ``UNet3DConditionModel`` still
 requires ``encoder_hidden_states`` in its forward pass; this script passes a
@@ -245,10 +247,10 @@ def parse_args():
     parser.add_argument("--loss_type", choices=["mae", "mse", "huber"], default="huber")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--channels", type=_parse_channels, default=(32, 64, 128))
-    parser.add_argument("--layers_per_block", type=int, default=2)
+    parser.add_argument("--layers_per_block", type=int, default=1)
     parser.add_argument("--norm_num_groups", type=int, default=16)
     parser.add_argument("--cross_attention_dim", type=int, default=128)
-    parser.add_argument("--attention_head_dim", type=int, default=4)
+    parser.add_argument("--attention_head_dim", type=int, default=2)
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument(
         "--mixed_precision",

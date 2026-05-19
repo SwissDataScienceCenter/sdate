@@ -128,7 +128,7 @@ def inpaint_guidance(
             target_volume=vol_init.to(device),
             source_volume=source_volume.to(device),
             angular_range_deg=180 - angular_range_deg,
-            start_angle_deg=start_angle - 80,
+            start_angle_deg=-(180 - angular_range_deg) // 2,
             tilt_axis=tilt_axis,
         )
         return recon
@@ -244,7 +244,7 @@ def iterative_refine_slice(
             tilt_axis=tilt_axis,
             device=device,
             timestep=int(t),
-            inpaint_steps=1,
+            inpaint_steps=4,
         )
         if average_gradient_steps:
             x = torch.mean(x, dim=0).repeat(x.shape[0], 1, 1)  # average over slices reduce noise

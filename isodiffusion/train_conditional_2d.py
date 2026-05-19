@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Train a 2D conditional DDPM on axial slices from 3D missing-wedge volumes.
 
-python /myhome/sdate/isodiffusion/train_conditional_2d.py --data_path /myhome/data/sdate/shared/compression_paper/file_1_extracted/reconstruction/la_fourier_1.npy --cone_width_deg 72 --patch_size 222 --volume_size 128 --batch_size 10 --epochs 300 --exp_name f1_2d --load_checkpoint=/myhome/iso_diffusion/checkpoints/ddpm_isodiffusion_f1_2d.pt --wandb
+python /myhome/sdate/isodiffusion/train_conditional_2d.py --data_path /myhome/data/sdate/shared/compression_paper/file_1_extracted/reconstruction/la_fourier_1.npy --cone_width_deg 72 --patch_size 222 --volume_size 128 --batch_size 10 --epochs 300 --exp_name f1_2d --load_checkpoint=/myhome/sdate/checkpoints/ddpm_isodiffusion2d_f1_2d.pt --wandb
 
 This script uses the same ``UNet2DModel`` architecture as
 ``ladiff/train_conditional_large_ladiff.py`` while loading 3D training pairs

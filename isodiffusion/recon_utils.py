@@ -9,7 +9,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from diffusers.models import UNet3DConditionModel
+from diffusers.models import UNet2DModel, UNet3DConditionModel
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -29,6 +29,23 @@ _TRAIN_CONDITIONAL_3D_UP_BLOCK_TYPES = (
     "CrossAttnUpBlock3D",
     "UpBlock3D",
     "UpBlock3D",
+)
+_TRAIN_CONDITIONAL_2D_DEFAULT_CHANNELS = (64, 64, 128, 128, 256, 256)
+_TRAIN_CONDITIONAL_2D_DOWN_BLOCK_TYPES = (
+    "DownBlock2D",
+    "DownBlock2D",
+    "DownBlock2D",
+    "DownBlock2D",
+    "AttnDownBlock2D",
+    "DownBlock2D",
+)
+_TRAIN_CONDITIONAL_2D_UP_BLOCK_TYPES = (
+    "UpBlock2D",
+    "AttnUpBlock2D",
+    "UpBlock2D",
+    "UpBlock2D",
+    "UpBlock2D",
+    "UpBlock2D",
 )
 
 
@@ -67,6 +84,28 @@ def create_unet3d_from_config(config: Dict) -> UNet3DConditionModel:
     )
 
 
+def create_unet2d_from_config(config: Dict) -> UNet2DModel:
+    """Create the same 2D conditional UNet used by train_conditional_2d."""
+    channels = _parse_channels(config.get("channels", _TRAIN_CONDITIONAL_2D_DEFAULT_CHANNELS))
+    expected_blocks = len(_TRAIN_CONDITIONAL_2D_DOWN_BLOCK_TYPES)
+    if len(channels) != expected_blocks:
+        raise ValueError(
+            "train_conditional_2d uses exactly "
+            f"{expected_blocks} block_out_channels, got {len(channels)}: {channels}"
+        )
+
+    return UNet2DModel(
+        sample_size=int(config.get("volume_size", 64)),
+        in_channels=2,
+        out_channels=1,
+        layers_per_block=int(config.get("layers_per_block", 2)),
+        block_out_channels=channels,
+        down_block_types=_TRAIN_CONDITIONAL_2D_DOWN_BLOCK_TYPES,
+        up_block_types=_TRAIN_CONDITIONAL_2D_UP_BLOCK_TYPES,
+        class_embed_type="timestep",
+    )
+
+
 def load_unet3d(
     checkpoint_path: Path,
     device: torch.device,
@@ -78,6 +117,23 @@ def load_unet3d(
         config_path = checkpoint_path.with_name(checkpoint_path.stem + "_norm.json")
     config = model_config_from_norm_json(Path(config_path))
     model = create_unet3d_from_config(config).to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model, config
+
+
+def load_unet2d(
+    checkpoint_path: Path,
+    device: torch.device,
+    config_path: Optional[Path] = None,
+) -> Tuple[UNet2DModel, Dict]:
+    """Load a 2D conditional UNet and its sidecar configuration."""
+    checkpoint_path = Path(checkpoint_path)
+    if config_path is None:
+        config_path = checkpoint_path.with_name(checkpoint_path.stem + "_norm.json")
+    config = model_config_from_norm_json(Path(config_path))
+    model = create_unet2d_from_config(config).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()

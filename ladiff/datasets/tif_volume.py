@@ -36,7 +36,7 @@ from torchvision.transforms.functional import InterpolationMode
 from torch.utils.data import Dataset
 
 
-def _resolve_file_list(start_file: Path, file_range: Optional[int]) -> List[Path]:
+def _resolve_file_list(start_file: Path, file_range: Optional[int], skip: int   ) -> List[Path]:
     """Return the list of tif files to load.
 
     Parameters
@@ -47,6 +47,8 @@ def _resolve_file_list(start_file: Path, file_range: Optional[int]) -> List[Path
     file_range:
         Total number of files to include (starting from *start_file*).
         ``None`` means only *start_file*.
+    skip:
+        Number of files to skip between included files.
 
     Returns
     -------
@@ -80,7 +82,7 @@ def _resolve_file_list(start_file: Path, file_range: Optional[int]) -> List[Path
                 candidates.append((num, entry))
 
     candidates.sort(key=lambda x: x[0])
-    selected = [f for _, f in candidates[:file_range]]
+    selected = [f for _, f in candidates[:file_range * (skip + 1):skip + 1]]
 
     if not selected:
         raise FileNotFoundError(
@@ -129,14 +131,16 @@ class TifVolumeSliceDataset(Dataset):
         resize: Optional[int] = None,
         normalize_range: Optional[Tuple[float, float]] = None,
         augment: bool = True,
+        skip: int = 0,
     ) -> None:
         data_path = Path(data_path)
         if not data_path.exists():
             raise FileNotFoundError(f"File not found: {data_path}")
 
-        self.files: List[Path] = _resolve_file_list(data_path, file_range)
+        self.files: List[Path] = _resolve_file_list(data_path, file_range, skip)
         self.resize = resize
         self.augment = augment
+        self.skip = skip
 
         # Count slices per file using tifffile metadata (no full read yet).
         import tifffile  # deferred import so the module is optional at import time

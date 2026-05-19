@@ -1,0 +1,30 @@
+# Requirements for the isodiffusion package and its training/reconstruction scripts.
+#
+# PyTorch wheels are platform/CUDA specific. If you need a specific CUDA build,
+# install torch/torchvision from https://pytorch.org/get-started/locally/ first,
+# then install the rest of this file.
+
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+diffusers>=0.34.0
+transformers>=4.30.0
+accelerate>=0.24.0
+Pillow>=9.0.0
+lovely-tensors>=0.1.18
+tqdm>=4.64.0
+wandb>=0.15.0
+
+# Local/private dependency used by:
+#   isodiffusion/train_conditional_2d.py
+#   isodiffusion/train_conditional_3d.py
+#
+# Those scripts currently add /myhome/BaseTraining, /myhome/sdsc, and
+# /myhome/chip-project to sys.path before importing pytorch_base. If that
+# package is not already available in your environment, install the matching
+# local checkout separately, for example:
+#
+#   pip install -e /myhome/BaseTraining --no-deps
+#
+# Optional acceleration for --enable_xformers:
+# xformers

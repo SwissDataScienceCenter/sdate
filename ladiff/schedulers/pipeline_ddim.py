@@ -175,6 +175,7 @@ class DDIMPipeline(DiffusionPipeline):
         self,
         initial_guess: torch.Tensor,
         start_step: int = 10,
+        p_use_conditioning: float = 1.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         eta: float = 0.0,
         num_inference_steps: int = 50,
@@ -195,6 +196,8 @@ class DDIMPipeline(DiffusionPipeline):
                 E.g. if `num_inference_steps=50` and `start_step=10`, denoising runs from
                 timestep index 10 to 49 (the last 40 steps). Lower values add more noise and
                 run more steps; higher values preserve more of the initial guess.
+            p_use_conditioning (`float`, *optional*, defaults to 0.5):
+                Probability of using conditioning on each slice during denoising.
             generator (`torch.Generator`, *optional*):
                 A generator for deterministic noise sampling.
             eta (`float`, *optional*, defaults to 0.0):
@@ -227,13 +230,16 @@ class DDIMPipeline(DiffusionPipeline):
                 f"{len(timesteps)} steps (valid: 0 to {len(timesteps) - 1})."
             )
 
+        if p_use_conditioning < 0.0 or p_use_conditioning > 1.0:
+            raise ValueError("p_use_conditioning must be between 0.0 and 1.0.")
+
         # Add noise at the starting timestep
         noise = randn_tensor(image.shape, generator=generator, device=device, dtype=image.dtype)
         start_timestep = timesteps[start_step]
         image = self.scheduler.add_noise(image, noise, start_timestep)
 
         # Denoise from start_step onward
-        fdk_prior = self.fdk_prior
+        fdk_prior = self.fdk_prior # already normalized in __init__
         truncated_timesteps = timesteps[start_step:]
 
         for t in self.progress_bar(truncated_timesteps):
@@ -246,6 +252,10 @@ class DDIMPipeline(DiffusionPipeline):
             else:
                 model_input = noisy_slices.unsqueeze(1)  # (D,1,H,W)
 
+            if hasattr(self.unet.config, 'class_embed_type') and self.unet.config.class_embed_type is not None:
+                use_conditioning = torch.rand((D,), device=device) < p_use_conditioning  # randomly decide if we do conditioning or not on this slice
+                model_input[:, 1] *= use_conditioning[:, None, None]
+
             slice_idx = torch.arange(D, device=device)
             with torch.no_grad():
                 noise_pred_slices = torch.empty((D, 1, H, W), device=device, dtype=model_input.dtype)
@@ -253,10 +263,12 @@ class DDIMPipeline(DiffusionPipeline):
                     end = min(start + self.slice_batch_size, D)
                     chunk_input = model_input[start:end]
                     chunk_slice_idx = slice_idx[start:end]
+                
 
                     if hasattr(self.unet.config, 'class_embed_type') and self.unet.config.class_embed_type is not None:
+                        conditional_labels = use_conditioning[start:end]
                         pred_chunk = self.unet(
-                            chunk_input, t, class_labels=torch.LongTensor([0.]).repeat(chunk_input.shape[0]).to(device), return_dict=False
+                            chunk_input, t, class_labels=conditional_labels, return_dict=False
                         )[0]
                     else:
                         pred_chunk = self.unet(

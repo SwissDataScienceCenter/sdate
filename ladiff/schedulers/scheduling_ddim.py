@@ -204,7 +204,7 @@ class GuidedDDIMScheduler(SchedulerMixin, ConfigMixin):
         prediction_type: str = "epsilon",
         thresholding: bool = False,
         dynamic_thresholding_ratio: float = 0.995,
-        clip_sample_range: float = 1.0,
+        clip_sample_range: float = 6.0,
         sample_max_value: float = 1.0,
         timestep_spacing: str = "leading",
         rescale_betas_zero_snr: bool = False,
