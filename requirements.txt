@@ -15,6 +15,8 @@ lovely-tensors>=0.1.18
 tqdm>=4.64.0
 wandb>=0.15.0
 
+
+
 # Local/private dependency used by:
 #   isodiffusion/train_conditional_2d.py
 #   isodiffusion/train_conditional_3d.py
@@ -28,3 +30,22 @@ wandb>=0.15.0
 #
 # Optional acceleration for --enable_xformers:
 # xformers
+
+ipykernel
+jupyter_server
+jupyterlab
+opencv-python
+matplotlib
+h5py
+hdf5plugin
+einops
+renku
+pyarrow
+scikit-image
+diffusers
+transformers
+accelerate
+nibabel
+kornia
+joblib
+SimpleITK
