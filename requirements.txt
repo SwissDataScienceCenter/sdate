@@ -31,9 +31,7 @@ wandb>=0.15.0
 # Optional acceleration for --enable_xformers:
 # xformers
 
-ipykernel
-jupyter_server
-jupyterlab
+ipywidgets
 opencv-python
 matplotlib
 h5py
