@@ -37,7 +37,6 @@ matplotlib
 h5py
 hdf5plugin
 einops
-renku
 pyarrow
 scikit-image
 diffusers
