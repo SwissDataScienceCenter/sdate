@@ -48,6 +48,10 @@ _TRAIN_CONDITIONAL_2D_UP_BLOCK_TYPES = (
     "UpBlock2D",
 )
 
+_ISONET_3D_DEFAULT_CHANNELS = (32, 64, 128)
+_ISONET_3D_DOWN_BLOCK_TYPES = ("DownBlock3D", "DownBlock3D", "CrossAttnDownBlock3D")
+_ISONET_3D_UP_BLOCK_TYPES = ("CrossAttnUpBlock3D", "UpBlock3D", "UpBlock3D")
+
 
 def _parse_channels(value) -> Tuple[int, ...]:
     if isinstance(value, str):
@@ -134,6 +138,45 @@ def load_unet2d(
         config_path = checkpoint_path.with_name(checkpoint_path.stem + "_norm.json")
     config = model_config_from_norm_json(Path(config_path))
     model = create_unet2d_from_config(config).to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model, config
+
+
+def create_isonet3d_from_config(config: Dict) -> UNet3DConditionModel:
+    """Create the 3D UNet used by train_isonet_3d (single-channel direct regression)."""
+    channels = _parse_channels(config.get("channels", _ISONET_3D_DEFAULT_CHANNELS))
+    expected_blocks = len(_ISONET_3D_DOWN_BLOCK_TYPES)
+    if len(channels) != expected_blocks:
+        raise ValueError(
+            f"isonet uses exactly {expected_blocks} block_out_channels, got {len(channels)}: {channels}"
+        )
+    return UNet3DConditionModel(
+        sample_size=int(config.get("volume_size", 64)),
+        in_channels=1,
+        out_channels=1,
+        down_block_types=_ISONET_3D_DOWN_BLOCK_TYPES,
+        up_block_types=_ISONET_3D_UP_BLOCK_TYPES,
+        block_out_channels=channels,
+        layers_per_block=int(config.get("layers_per_block", 1)),
+        cross_attention_dim=int(config.get("cross_attention_dim", 128)),
+        attention_head_dim=int(config.get("attention_head_dim", 2)),
+        norm_num_groups=int(config.get("norm_num_groups", 16)),
+    )
+
+
+def load_isonet3d(
+    checkpoint_path: Path,
+    device: torch.device,
+    config_path: Optional[Path] = None,
+) -> Tuple[UNet3DConditionModel, Dict]:
+    """Load an isonet 3D UNet and its sidecar configuration."""
+    checkpoint_path = Path(checkpoint_path)
+    if config_path is None:
+        config_path = checkpoint_path.with_name(checkpoint_path.stem + "_norm.json")
+    config = model_config_from_norm_json(Path(config_path))
+    model = create_isonet3d_from_config(config).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
