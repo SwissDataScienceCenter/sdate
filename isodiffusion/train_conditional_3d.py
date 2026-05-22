@@ -95,6 +95,15 @@ def _parse_channels(value: str) -> Tuple[int, ...]:
     return channels
 
 
+def _parse_volume_size(value: str):
+    parts = [int(v.strip()) for v in value.split(",") if v.strip()]
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 3:
+        return tuple(parts)
+    raise ValueError("--volume_size must be a single int (e.g. 96) or D,H,W (e.g. 15,96,96)")
+
+
 def _add_bool_arg(
     parser: ArgumentParser,
     name: str,
@@ -114,13 +123,22 @@ def _add_bool_arg(
     parser.set_defaults(**{name: default})
 
 
-def create_model(args) -> UNet3DConditionModel:
-    from diffusers import UNet3DConditionModel
+def create_model(args):
+    if args.model_type == "dynunet":
+        from isodiffusion.dynunet_wrapper import DynUNetDiffusion, parse_dynunet_filters
+        filters = parse_dynunet_filters(args.dynunet_filters)
+        return DynUNetDiffusion(
+            in_channels=2,
+            out_channels=1,
+            filters=filters,
+            time_embed_dim=args.dynunet_time_embed_dim,
+        )
 
-    model = UNet3DConditionModel(
-        sample_size=args.volume_size,
-        in_channels=2,          # or latent channels, e.g. 4
-        out_channels=1,         # same as prediction target
+    from diffusers import UNet3DConditionModel
+    return UNet3DConditionModel(
+        sample_size=list(args.volume_size) if isinstance(args.volume_size, tuple) else args.volume_size,
+        in_channels=2,
+        out_channels=1,
         down_block_types=(
             "DownBlock3D",
             "DownBlock3D",
@@ -137,9 +155,6 @@ def create_model(args) -> UNet3DConditionModel:
         attention_head_dim=args.attention_head_dim,
         norm_num_groups=args.norm_num_groups,
     )
-    
-
-    return model
 
 
 def enable_optional_attention_acceleration(model: UNet3DConditionModel, enabled: bool) -> None:
@@ -227,7 +242,7 @@ def parse_args():
     parser.add_argument("--norm_min", type=float, default=None)
     parser.add_argument("--norm_max", type=float, default=None)
     parser.add_argument("--patch_size", type=int, default=112)
-    parser.add_argument("--volume_size", type=int, default=64)
+    parser.add_argument("--volume_size", type=_parse_volume_size, default=64)
     parser.add_argument("--samples_per_volume", type=int, default=None)
     parser.add_argument("--carve_center_angle_deg", type=float, default=0.0)
     parser.add_argument("--tilt_axis", type=int, default=0)
@@ -246,11 +261,17 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--loss_type", choices=["mae", "mse", "huber"], default="huber")
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--model_type", choices=["unet3d", "dynunet"], default="unet3d",
+                        help="Network architecture: unet3d (diffusers) or dynunet (MONAI).")
     parser.add_argument("--channels", type=_parse_channels, default=(32, 64, 128))
     parser.add_argument("--layers_per_block", type=int, default=1)
     parser.add_argument("--norm_num_groups", type=int, default=16)
     parser.add_argument("--cross_attention_dim", type=int, default=128)
-    parser.add_argument("--attention_head_dim", type=int, default=2)
+    parser.add_argument("--attention_head_dim", type=int, default=8)
+    parser.add_argument("--dynunet_filters", type=str, default="32,64,128,256,320",
+                        help="Comma-separated filter counts per DynUNet level (used when --model_type dynunet).")
+    parser.add_argument("--dynunet_time_embed_dim", type=int, default=256,
+                        help="Sinusoidal timestep embedding dimension for DynUNet diffusion.")
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument("--save_checkpoint", type=str, default="", help="Absolute path to save the checkpoint. Defaults to checkpoints/ddpm_isodiffusion_<exp_name>.pt")
     parser.add_argument(
@@ -323,31 +344,37 @@ def main() -> None:
         f"samples/sample_carved_x_{args.exp_name}.png"
     )
 
-    model = create_model(args)
-    
     if args.save_checkpoint:
         checkpoint_path = args.save_checkpoint
         os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
     else:
         os.makedirs("checkpoints", exist_ok=True)
         checkpoint_path = f"checkpoints/ddpm_isodiffusion_{args.exp_name}.pt"
-        
+
+    model = create_model(args)
+
     norm_config_path = checkpoint_path.replace(".pt", "_norm.json")
     with open(norm_config_path, "w") as f:
+        from isodiffusion.dynunet_wrapper import parse_dynunet_filters
         json.dump(
             {
+                "arch": args.model_type,
                 "norm_min": norm_min,
                 "norm_max": norm_max,
                 "cone_width_deg": args.cone_width_deg,
                 "patch_size": args.patch_size,
-                "volume_size": args.volume_size,
+                "volume_size": list(args.volume_size) if isinstance(args.volume_size, tuple) else args.volume_size,
                 "carve_center_angle_deg": args.carve_center_angle_deg,
                 "tilt_axis": args.tilt_axis,
-                "channels": args.channels,
+                # unet3d params
+                "channels": list(args.channels),
                 "layers_per_block": args.layers_per_block,
                 "norm_num_groups": args.norm_num_groups,
-                "cross_attention_dim": args.cross_attention_dim,
+                "cross_attention_dim": model.config.cross_attention_dim,
                 "attention_head_dim": args.attention_head_dim,
+                # dynunet params
+                "dynunet_filters": parse_dynunet_filters(args.dynunet_filters) if args.model_type == "dynunet" else None,
+                "dynunet_time_embed_dim": args.dynunet_time_embed_dim if args.model_type == "dynunet" else None,
                 "mixed_precision": args.mixed_precision,
                 "allow_tf32": args.allow_tf32,
                 "cudnn_benchmark": args.cudnn_benchmark,
@@ -375,7 +402,7 @@ def main() -> None:
     loss_fn = ConditionalIsoDiffusionLoss(
         noise_scheduler,
         device,
-        cross_attention_dim=args.cross_attention_dim,
+        cross_attention_dim=model.config.cross_attention_dim,
         loss_type=args.loss_type,
     )
 

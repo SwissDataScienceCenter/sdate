@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+VolumeSize = Union[int, Tuple[int, int, int]]
+
 
 def _resolve_npy_files(data_path: Path) -> List[Path]:
     if data_path.is_file():
@@ -103,15 +105,29 @@ def _center_crop_cube(volume: torch.Tensor, size: int) -> torch.Tensor:
     return volume[z0 : z0 + size, y0 : y0 + size, x0 : x0 + size].contiguous()
 
 
+def _random_depth_crop(volume: torch.Tensor, target_d: int) -> torch.Tensor:
+    d = volume.shape[0]
+    if d < target_d:
+        raise ValueError(f"Cannot depth-crop {target_d} from shape {tuple(volume.shape)}")
+    z0 = int(torch.randint(0, d - target_d + 1, (1,)).item()) if d > target_d else 0
+    return volume[z0 : z0 + target_d].contiguous()
+
+
 class BaseVolumeDataset(Dataset):
-    """Base class for 3D volume datasets that sample patches and carve Fourier wedges."""
+    """Base class for 3D volume datasets that sample patches and carve Fourier wedges.
+
+    ``target_size`` may be a single int for cubic patches or a ``(D, H, W)`` tuple
+    for slab-shaped patches where ``D <= H == W``.  The pipeline always first
+    center-crops a ``H^3`` cube (after optional rotation), then takes a random
+    depth crop of size ``D`` from that cube.
+    """
 
     def __init__(
         self,
         data_path: Union[str, Path],
         cone_width_deg: float,
         patch_size: int = 112,
-        target_size: int = 64,
+        target_size: VolumeSize = 64,
         normalize_range: Optional[Tuple[float, float]] = None,
         samples_per_volume: Optional[int] = None,
         tilt_axis: int = 0,
@@ -121,20 +137,34 @@ class BaseVolumeDataset(Dataset):
         self.files = _resolve_npy_files(self.data_path)
         self.cone_width_deg = float(cone_width_deg)
         self.patch_size = int(patch_size)
-        self.target_size = int(target_size)
         self.samples_per_volume = samples_per_volume
         self.tilt_axis = int(tilt_axis)
         self.rotate = bool(rotate)
 
-        if self.rotate and self.patch_size < math.ceil(self.target_size * math.sqrt(3.0)):
+        if isinstance(target_size, (list, tuple)):
+            target_size = tuple(int(v) for v in target_size)
+            d, h, w = target_size
+            if h != w:
+                raise ValueError(f"target_size H and W must be equal, got {target_size}")
+            if d > h:
+                raise ValueError(f"target_size D must be <= H=W, got {target_size}")
+            self.target_size: VolumeSize = target_size
+            self._cube_size = h
+            self._is_slab = True
+        else:
+            self.target_size = int(target_size)
+            self._cube_size = int(target_size)
+            self._is_slab = False
+
+        if self.rotate and self.patch_size < math.ceil(self._cube_size * math.sqrt(3.0)):
             raise ValueError(
-                "patch_size must be at least ceil(target_size * sqrt(3)) so the "
+                "patch_size must be at least ceil(cube_size * sqrt(3)) so the "
                 "post-rotation crop lies inside the inscribed sphere. For "
-                f"target_size={self.target_size}, use patch_size >= "
-                f"{math.ceil(self.target_size * math.sqrt(3.0))}."
+                f"cube_size={self._cube_size}, use patch_size >= "
+                f"{math.ceil(self._cube_size * math.sqrt(3.0))}."
             )
-        elif not self.rotate and self.patch_size < self.target_size:
-            raise ValueError(f"patch_size ({self.patch_size}) must be >= target_size ({self.target_size}) when not rotating.")
+        elif not self.rotate and self.patch_size < self._cube_size:
+            raise ValueError(f"patch_size ({self.patch_size}) must be >= cube_size ({self._cube_size}) when not rotating.")
 
         self._volumes: List[Optional[np.ndarray]] = [None] * len(self.files)
         self._shapes: List[Tuple[int, int, int]] = []
@@ -213,7 +243,9 @@ class BaseVolumeDataset(Dataset):
         if self.rotate:
             patch = _rotate_volume(patch, _random_rotation_matrix())
 
-        x = _center_crop_cube(patch, self.target_size)
+        x = _center_crop_cube(patch, self._cube_size)
+        if self._is_slab:
+            x = _random_depth_crop(x, self.target_size[0])
         carved_x = self._carve_wedge(x)
         return carved_x.contiguous(), x.contiguous()
 

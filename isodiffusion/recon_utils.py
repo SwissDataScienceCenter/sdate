@@ -59,13 +59,38 @@ def _parse_channels(value) -> Tuple[int, ...]:
     return tuple(int(v) for v in value)
 
 
+def _parse_volume_size_from_config(config: Dict, default: int = 64):
+    """Return volume_size as int (cubic) or tuple (D, H, W) from a norm-config dict."""
+    raw = config.get("volume_size", default)
+    if isinstance(raw, (list, tuple)):
+        return tuple(int(v) for v in raw)
+    return int(raw)
+
+
 def model_config_from_norm_json(path: Path) -> Dict:
     with open(path) as f:
         return json.load(f)
 
 
 def create_unet3d_from_config(config: Dict) -> UNet3DConditionModel:
-    """Create the same 3D conditional UNet used by train_conditional_3d."""
+    """Create the same 3D conditional UNet used by train_conditional_3d.
+
+    When ``config["arch"] == "dynunet"`` the MONAI DynUNetDiffusion wrapper is
+    returned instead so that checkpoints saved with either architecture can be
+    loaded with the same call.
+    """
+    if config.get("arch", "unet3d") == "dynunet":
+        from isodiffusion.dynunet_wrapper import DynUNetDiffusion, parse_dynunet_filters
+        filters = parse_dynunet_filters(
+            config.get("dynunet_filters", [32, 64, 128, 256, 320])
+        )
+        return DynUNetDiffusion(
+            in_channels=2,
+            out_channels=1,
+            filters=filters,
+            time_embed_dim=int(config.get("dynunet_time_embed_dim", 256)),
+        )
+
     channels = _parse_channels(config.get("channels", _TRAIN_CONDITIONAL_3D_DEFAULT_CHANNELS))
     expected_blocks = len(_TRAIN_CONDITIONAL_3D_DOWN_BLOCK_TYPES)
     if len(channels) != expected_blocks:
@@ -75,7 +100,7 @@ def create_unet3d_from_config(config: Dict) -> UNet3DConditionModel:
         )
 
     return UNet3DConditionModel(
-        sample_size=int(config.get("volume_size", 64)),
+        sample_size=_parse_volume_size_from_config(config, default=64),
         in_channels=2,
         out_channels=1,
         down_block_types=_TRAIN_CONDITIONAL_3D_DOWN_BLOCK_TYPES,
@@ -144,8 +169,19 @@ def load_unet2d(
     return model, config
 
 
-def create_isonet3d_from_config(config: Dict) -> UNet3DConditionModel:
-    """Create the 3D UNet used by train_isonet_3d (single-channel direct regression)."""
+def create_isonet3d_from_config(config: Dict):
+    """Create the 3D UNet used by train_isonet_3d (single-channel direct regression).
+
+    When ``config["arch"] == "dynunet"`` the MONAI DynUNetIsoNet wrapper is
+    returned instead.
+    """
+    if config.get("arch", "unet3d") == "dynunet":
+        from isodiffusion.dynunet_wrapper import DynUNetIsoNet, parse_dynunet_filters
+        filters = parse_dynunet_filters(
+            config.get("dynunet_filters", [32, 64, 128, 256, 320])
+        )
+        return DynUNetIsoNet(in_channels=1, out_channels=1, filters=filters)
+
     channels = _parse_channels(config.get("channels", _ISONET_3D_DEFAULT_CHANNELS))
     expected_blocks = len(_ISONET_3D_DOWN_BLOCK_TYPES)
     if len(channels) != expected_blocks:
@@ -153,7 +189,7 @@ def create_isonet3d_from_config(config: Dict) -> UNet3DConditionModel:
             f"isonet uses exactly {expected_blocks} block_out_channels, got {len(channels)}: {channels}"
         )
     return UNet3DConditionModel(
-        sample_size=int(config.get("volume_size", 64)),
+        sample_size=_parse_volume_size_from_config(config, default=64),
         in_channels=1,
         out_channels=1,
         down_block_types=_ISONET_3D_DOWN_BLOCK_TYPES,
@@ -200,19 +236,23 @@ def patch_starts(length: int, patch_size: int, overlap: int) -> List[int]:
 
 def iter_patch_slices(
     shape: Sequence[int],
-    patch_size: int,
+    patch_size: Union[int, Tuple[int, int, int]],
     overlap: int,
 ) -> Iterable[Tuple[slice, slice, slice]]:
-    z_starts = patch_starts(int(shape[0]), patch_size, overlap)
-    y_starts = patch_starts(int(shape[1]), patch_size, overlap)
-    x_starts = patch_starts(int(shape[2]), patch_size, overlap)
+    if isinstance(patch_size, (list, tuple)):
+        ps_d, ps_h, ps_w = (int(v) for v in patch_size)
+    else:
+        ps_d = ps_h = ps_w = int(patch_size)
+    z_starts = patch_starts(int(shape[0]), ps_d, overlap)
+    y_starts = patch_starts(int(shape[1]), ps_h, overlap)
+    x_starts = patch_starts(int(shape[2]), ps_w, overlap)
     for z0 in z_starts:
         for y0 in y_starts:
             for x0 in x_starts:
                 yield (
-                    slice(z0, z0 + patch_size),
-                    slice(y0, y0 + patch_size),
-                    slice(x0, x0 + patch_size),
+                    slice(z0, z0 + ps_d),
+                    slice(y0, y0 + ps_h),
+                    slice(x0, x0 + ps_w),
                 )
 
 

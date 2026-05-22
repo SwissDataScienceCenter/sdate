@@ -16,7 +16,7 @@ import torch
 
 from isodiffusion.fourier_wedge import apply_missing_wedge
 
-from ._base import BaseVolumeDataset
+from ._base import BaseVolumeDataset, VolumeSize
 
 
 class MissingConeVolumes(BaseVolumeDataset):
@@ -31,7 +31,7 @@ class MissingConeVolumes(BaseVolumeDataset):
         data_path: Union[str, Path],
         cone_width_deg: float,
         patch_size: int = 112,
-        target_size: int = 64,
+        target_size: VolumeSize = 64,
         normalize_range: Optional[Tuple[float, float]] = None,
         samples_per_volume: Optional[int] = None,
         carve_center_angle_deg: float = 0.0,

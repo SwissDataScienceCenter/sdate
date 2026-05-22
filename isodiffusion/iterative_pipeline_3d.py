@@ -26,13 +26,17 @@ def parse_args():
     # Training params
     parser.add_argument("--cone_width_deg", type=float, default=72.0)
     parser.add_argument("--patch_size", type=int, default=167)
-    parser.add_argument("--volume_size", type=int, default=96)
+    parser.add_argument("--volume_size", type=lambda s: (tuple(int(v) for v in s.split(",")) if "," in s else int(s)), default=96)
     parser.add_argument("--batch_size", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=50, help="Epochs for round 0")
     parser.add_argument("--finetune_epochs", type=int, default=10, help="Epochs for finetuning in round > 0")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--exp_name", type=str, default="isodiffusion_iterative")
     parser.add_argument("--no_rotate", action="store_true", help="Disable rotation during training")
+    parser.add_argument("--model_type", choices=["unet3d", "dynunet"], default="unet3d",
+                        help="Network architecture forwarded to train_conditional_3d.py.")
+    parser.add_argument("--dynunet_filters", type=str, default="32,64,128,256,320",
+                        help="Comma-separated DynUNet filter counts (used when --model_type dynunet).")
     
     # Inference params
     parser.add_argument("--overlap", type=int, default=10)
@@ -51,7 +55,7 @@ def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetun
         "--data_path", str(data_path),
         "--cone_width_deg", str(args.cone_width_deg),
         "--patch_size", str(args.patch_size),
-        "--volume_size", str(args.volume_size),
+        "--volume_size", ",".join(str(v) for v in args.volume_size) if isinstance(args.volume_size, (tuple, list)) else str(args.volume_size),
         "--batch_size", str(args.batch_size),
         "--epochs", str(epochs),
         "--learning_rate", str(args.learning_rate),
@@ -60,9 +64,12 @@ def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetun
     ]
     if args.no_rotate:
         cmd.append("--no_rotate")
+    cmd.extend(["--model_type", args.model_type])
+    if args.model_type == "dynunet":
+        cmd.extend(["--dynunet_filters", args.dynunet_filters])
     if is_finetuning and Path(checkpoint_path).exists():
         cmd.extend(["--load_checkpoint", str(checkpoint_path)])
-        
+
     print(f"Running training: {' '.join(cmd)}")
     result = subprocess.run(cmd)
     if result.returncode != 0:

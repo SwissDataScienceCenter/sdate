@@ -9,7 +9,6 @@ Each round:
 """
 
 import multiprocessing
-import os
 import subprocess
 import sys 
 from pathlib import Path
@@ -35,13 +34,17 @@ def parse_args():
     # Training params
     parser.add_argument("--cone_width_deg", type=float, default=72.0)
     parser.add_argument("--patch_size", type=int, default=167)
-    parser.add_argument("--volume_size", type=int, default=96)
+    parser.add_argument("--volume_size", type=lambda s: (tuple(int(v) for v in s.split(",")) if "," in s else int(s)), default=96)
     parser.add_argument("--batch_size", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=50, help="Epochs for round 0")
     parser.add_argument("--finetune_epochs", type=int, default=10, help="Epochs for finetuning in round > 0")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--exp_name", type=str, default="isonet_iterative")
     parser.add_argument("--no_rotate", action="store_true")
+    parser.add_argument("--model_type", choices=["unet3d", "dynunet"], default="unet3d",
+                        help="Network architecture forwarded to train_isonet_3d.py.")
+    parser.add_argument("--dynunet_filters", type=str, default="32,64,128,256,320",
+                        help="Comma-separated DynUNet filter counts (used when --model_type dynunet).")
 
     # Inference params
     parser.add_argument("--overlap", type=int, default=10)
@@ -57,7 +60,7 @@ def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetun
         "--data_path", str(data_path),
         "--cone_width_deg", str(args.cone_width_deg),
         "--patch_size", str(args.patch_size),
-        "--volume_size", str(args.volume_size),
+        "--volume_size", ",".join(str(v) for v in args.volume_size) if isinstance(args.volume_size, (tuple, list)) else str(args.volume_size),
         "--batch_size", str(args.batch_size),
         "--epochs", str(epochs),
         "--learning_rate", str(args.learning_rate),
@@ -66,6 +69,9 @@ def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetun
     ]
     if args.no_rotate:
         cmd.append("--no_rotate")
+    cmd.extend(["--model_type", args.model_type])
+    if args.model_type == "dynunet":
+        cmd.extend(["--dynunet_filters", args.dynunet_filters])
     if is_finetuning and Path(checkpoint_path).exists():
         cmd.extend(["--load_checkpoint", str(checkpoint_path)])
 
@@ -86,7 +92,7 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
     from isodiffusion.fourier_wedge import apply_missing_wedge, enforce_known_fourier
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, config = load_isonet3d(checkpoint_path, device=device)
+    model, _ = load_isonet3d(checkpoint_path, device=device)
     normalize_fn, denormalize_fn, norm_config = load_norm_fns_from_checkpoint_sidecar(checkpoint_path)
 
     cone_width_deg = float(norm_config.get("cone_width_deg", 72.0))
@@ -94,7 +100,11 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
     center = float(norm_config.get("carve_center_angle_deg", 0.0))
     start_angle_deg = (center + cone_width_deg / 2.0) % 180.0
     tilt_axis = int(norm_config.get("tilt_axis", 0))
-    patch_size = int(norm_config.get("volume_size", args.volume_size))
+    volume_size_raw = norm_config.get("volume_size", args.volume_size)
+    if isinstance(volume_size_raw, (list, tuple)):
+        patch_d, patch_h, patch_w = (int(v) for v in volume_size_raw)
+    else:
+        patch_d = patch_h = patch_w = int(volume_size_raw)
     cross_attention_dim = int(norm_config.get("cross_attention_dim", 128))
 
     current_vol = load_npy_volume(current_vol_path)  # (D, H, W), raw values
@@ -104,9 +114,9 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
     carved_norm = normalize_fn(carved_vol)  # (D, H, W), normalized
 
     d, h, w = carved_norm.shape
-    d_starts = patch_starts(d, patch_size, args.overlap)
-    h_starts = patch_starts(h, patch_size, args.overlap)
-    w_starts = patch_starts(w, patch_size, args.overlap)
+    d_starts = patch_starts(d, patch_d, args.overlap)
+    h_starts = patch_starts(h, patch_h, args.overlap)
+    w_starts = patch_starts(w, patch_w, args.overlap)
 
     positions = [
         (d0, h0, w0)
@@ -115,7 +125,7 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
         for w0 in w_starts
     ]
     patches = [
-        carved_norm[d0:d0 + patch_size, h0:h0 + patch_size, w0:w0 + patch_size]
+        carved_norm[d0:d0 + patch_d, h0:h0 + patch_h, w0:w0 + patch_w]
         for d0, h0, w0 in positions
     ]
 
@@ -138,8 +148,8 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
             )[0].squeeze(1).cpu()  # (B, D, H, W)
 
             for i, (d0, h0, w0) in enumerate(batch_pos):
-                output[d0:d0 + patch_size, h0:h0 + patch_size, w0:w0 + patch_size] += pred[i]
-                counts[d0:d0 + patch_size, h0:h0 + patch_size, w0:w0 + patch_size] += 1.0
+                output[d0:d0 + patch_d, h0:h0 + patch_h, w0:w0 + patch_w] += pred[i]
+                counts[d0:d0 + patch_d, h0:h0 + patch_h, w0:w0 + patch_w] += 1.0
 
     recon = output / counts.clamp_min(1.0)
     recon = denormalize_fn(recon)

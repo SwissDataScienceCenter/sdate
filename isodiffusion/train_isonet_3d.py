@@ -91,6 +91,15 @@ def _parse_channels(value: str) -> Tuple[int, ...]:
     return channels
 
 
+def _parse_volume_size(value: str):
+    parts = [int(v.strip()) for v in value.split(",") if v.strip()]
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 3:
+        return tuple(parts)
+    raise ValueError("--volume_size must be a single int (e.g. 96) or D,H,W (e.g. 15,96,96)")
+
+
 def _add_bool_arg(parser, name, default, help_text, disable_help):
     dashed_name = name.replace("_", "-")
     enabled_flags = [f"--{name}"]
@@ -103,9 +112,14 @@ def _add_bool_arg(parser, name, default, help_text, disable_help):
     parser.set_defaults(**{name: default})
 
 
-def create_model(args) -> UNet3DConditionModel:
+def create_model(args):
+    if args.model_type == "dynunet":
+        from isodiffusion.dynunet_wrapper import DynUNetIsoNet, parse_dynunet_filters
+        filters = parse_dynunet_filters(args.dynunet_filters)
+        return DynUNetIsoNet(in_channels=1, out_channels=1, filters=filters)
+
     return UNet3DConditionModel(
-        sample_size=args.volume_size,
+        sample_size=list(args.volume_size)[-2:] if isinstance(args.volume_size, tuple) else args.volume_size,
         in_channels=1,
         out_channels=1,
         down_block_types=("DownBlock3D", "DownBlock3D", "CrossAttnDownBlock3D"),
@@ -170,7 +184,7 @@ def parse_args():
     parser.add_argument("--norm_min", type=float, default=None)
     parser.add_argument("--norm_max", type=float, default=None)
     parser.add_argument("--patch_size", type=int, default=112)
-    parser.add_argument("--volume_size", type=int, default=64)
+    parser.add_argument("--volume_size", type=_parse_volume_size, default=64)
     parser.add_argument("--samples_per_volume", type=int, default=None)
     parser.add_argument("--carve_center_angle_deg", type=float, default=0.0)
     parser.add_argument("--tilt_axis", type=int, default=0)
@@ -179,21 +193,25 @@ def parse_args():
 
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-3)
-    parser.add_argument("--scheduler", type=str, default="[500]")
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=0)
+    parser.add_argument("--scheduler", type=str, default="[50000000]")
     parser.add_argument("--lr_decay", type=float, default=0.1)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--exp_name", type=str, default="isonet3d")
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--loss_type", choices=["mae", "mse", "huber"], default="huber")
+    parser.add_argument("--loss_type", choices=["mae", "mse", "huber"], default="mae")
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--model_type", choices=["unet3d", "dynunet"], default="unet3d",
+                        help="Network architecture: unet3d (diffusers) or dynunet (MONAI).")
     parser.add_argument("--channels", type=_parse_channels, default=(32, 64, 128))
     parser.add_argument("--layers_per_block", type=int, default=1)
     parser.add_argument("--norm_num_groups", type=int, default=16)
     parser.add_argument("--cross_attention_dim", type=int, default=128)
-    parser.add_argument("--attention_head_dim", type=int, default=2)
+    parser.add_argument("--attention_head_dim", type=int, default=8)
+    parser.add_argument("--dynunet_filters", type=str, default="32,64,128,256,320",
+                        help="Comma-separated filter counts per DynUNet level (used when --model_type dynunet).")
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument("--save_checkpoint", type=str, default="", help="Absolute path to save the checkpoint.")
     parser.add_argument("--mixed_precision", choices=["no", "fp16", "bf16", "auto"], default="fp16")
@@ -222,8 +240,6 @@ def main() -> None:
     TF.to_pil_image(x_sample[mid].clamp(0, 1)).save(f"samples/sample_x_{args.exp_name}.png")
     TF.to_pil_image(carved_sample[mid].clamp(0, 1)).save(f"samples/sample_carved_x_{args.exp_name}.png")
 
-    model = create_model(args)
-
     if args.save_checkpoint:
         checkpoint_path = args.save_checkpoint
         os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
@@ -231,24 +247,31 @@ def main() -> None:
         os.makedirs("checkpoints", exist_ok=True)
         checkpoint_path = f"checkpoints/isonet_{args.exp_name}.pt"
 
+    model = create_model(args)
+
     norm_config_path = checkpoint_path.replace(".pt", "_norm.json")
     with open(norm_config_path, "w") as f:
+        from isodiffusion.dynunet_wrapper import parse_dynunet_filters
         json.dump(
             {
                 "model_type": "isonet",
+                "arch": args.model_type,
                 "in_channels": 1,
                 "norm_min": norm_min,
                 "norm_max": norm_max,
                 "cone_width_deg": args.cone_width_deg,
                 "patch_size": args.patch_size,
-                "volume_size": args.volume_size,
+                "volume_size": list(args.volume_size) if isinstance(args.volume_size, tuple) else args.volume_size,
                 "carve_center_angle_deg": args.carve_center_angle_deg,
                 "tilt_axis": args.tilt_axis,
+                # unet3d params
                 "channels": list(args.channels),
                 "layers_per_block": args.layers_per_block,
                 "norm_num_groups": args.norm_num_groups,
-                "cross_attention_dim": args.cross_attention_dim,
+                "cross_attention_dim": model.config.cross_attention_dim,
                 "attention_head_dim": args.attention_head_dim,
+                # dynunet params
+                "dynunet_filters": parse_dynunet_filters(args.dynunet_filters) if args.model_type == "dynunet" else None,
             },
             f,
             indent=2,
@@ -264,6 +287,7 @@ def main() -> None:
             print(f"Could not load checkpoint {args.load_checkpoint}: {exc}. Training from scratch.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
     model.to(device)
 
     if args.enable_xformers:
@@ -273,7 +297,7 @@ def main() -> None:
         except Exception as exc:
             print(f"xFormers could not be enabled: {exc}")
 
-    loss_fn = IsoNetLoss(device, cross_attention_dim=args.cross_attention_dim, loss_type=args.loss_type)
+    loss_fn = IsoNetLoss(device, cross_attention_dim=model.config.cross_attention_dim, loss_type=args.loss_type)
 
     exp = PyTorchExperiment(
         args=vars(args),
