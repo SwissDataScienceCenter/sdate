@@ -178,7 +178,7 @@ def create_isonet3d_from_config(config: Dict):
     if config.get("arch", "unet3d") == "dynunet":
         from isodiffusion.dynunet_wrapper import DynUNetIsoNet, parse_dynunet_filters
         filters = parse_dynunet_filters(
-            config.get("dynunet_filters", [32, 64, 128, 256, 320])
+            config.get("dynunet_filters", [64, 128, 256, 384, 512])
         )
         return DynUNetIsoNet(in_channels=1, out_channels=1, filters=filters)
 

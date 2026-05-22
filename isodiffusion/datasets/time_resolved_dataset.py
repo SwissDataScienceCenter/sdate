@@ -19,7 +19,7 @@ from isodiffusion.fourier_wedge import _build_mask_2d_torch
 
 from ._base import BaseVolumeDataset
 
-
+ 
 class TimeResolvedVolumes(BaseVolumeDataset):
     """Dataset of ``(carved_x, x)`` pairs with a per-slice rotating missing wedge.
 

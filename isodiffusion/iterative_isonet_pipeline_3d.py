@@ -110,8 +110,11 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
     current_vol = load_npy_volume(current_vol_path)  # (D, H, W), raw values
 
     # Carve the current volume to produce the model input, matching training
-    carved_vol = apply_missing_wedge(current_vol, angular_range_deg, start_angle_deg, tilt_axis)
-    carved_norm = normalize_fn(carved_vol)  # (D, H, W), normalized
+    # carved_vol = apply_missing_wedge(current_vol, angular_range_deg, start_angle_deg, tilt_axis)
+    # carved_norm = normalize_fn(carved_vol)  # (D, H, W), normalized
+    
+    # no missing wedge is imposed before feeding it to the inference model, so input does not have a missing wedge (except from the firt round)
+    carved_norm = normalize_fn(current_vol)  # (D, H, W), normalized 
 
     d, h, w = carved_norm.shape
     d_starts = patch_starts(d, patch_d, args.overlap)
