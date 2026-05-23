@@ -265,17 +265,18 @@ class DDIMPipeline2D(DiffusionPipeline):
 
     @staticmethod
     def _patches_to_axis_slices(patches: torch.Tensor, axis: str) -> torch.Tensor:
-        if patches.dim() != 5:
-            raise ValueError(f"patches must have shape (N, C, D, H, W), got {tuple(patches.shape)}")
+        with torch.no_grad():
+            if patches.dim() != 5:
+                raise ValueError(f"patches must have shape (N, C, D, H, W), got {tuple(patches.shape)}")
 
-        n_patches, channels, patch_d, patch_h, patch_w = patches.shape
-        if axis == "axial":
-            return patches.permute(0, 2, 1, 3, 4).reshape(n_patches * patch_d, channels, patch_h, patch_w)
-        if axis == "sagittal":
-            return patches.permute(0, 4, 1, 2, 3).reshape(n_patches * patch_w, channels, patch_d, patch_h)
-        if axis == "coronal":
-            return patches.permute(0, 3, 1, 2, 4).reshape(n_patches * patch_h, channels, patch_d, patch_w)
-        raise ValueError(f"Unsupported axis {axis!r}; expected one of axial, sagittal, coronal")
+            n_patches, channels, patch_d, patch_h, patch_w = patches.shape
+            if axis == "axial":
+                return patches.permute(0, 2, 1, 3, 4).reshape(n_patches * patch_d, channels, patch_h, patch_w)
+            if axis == "sagittal":
+                return patches.permute(0, 4, 1, 2, 3).reshape(n_patches * patch_w, channels, patch_d, patch_h)
+            if axis == "coronal":
+                return patches.permute(0, 3, 1, 2, 4).reshape(n_patches * patch_h, channels, patch_d, patch_w)
+            raise ValueError(f"Unsupported axis {axis!r}; expected one of axial, sagittal, coronal")
 
     @staticmethod
     def _axis_slices_to_patches(

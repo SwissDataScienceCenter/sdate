@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Iterative 3D IsoNet pipeline.
+"""Iterative 3D IsoNet pipeline for time-resolved missing-wedge data.
 
 Each round:
-  1. Train (or fine-tune) the IsoNet on the current volume.
-  2. Carve the current volume, run it through the model with subvolume patching,
-     aggregate patch predictions, and enforce Fourier consistency.
+  1. Train (or fine-tune) the IsoNet on the current volume using TimeResolvedVolumes.
+  2. Run the model with subvolume patching, aggregate patch predictions, and enforce
+     per-slice Fourier consistency (matching the per-slice 2-D FFT carving used during training).
   3. The output reconstruction becomes the input for the next round.
 """
 
 import multiprocessing
 import subprocess
-import sys 
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +23,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 def parse_args():
     import argparse
-    parser = argparse.ArgumentParser(description="Iterative 3D IsoNet Pipeline")
+    parser = argparse.ArgumentParser(description="Iterative 3D IsoNet Pipeline (Time-Resolved)")
     parser.add_argument("--data_path", type=str, required=True, help="Starting volume (measured/conditioned)")
     parser.add_argument("--ground_truth_path", type=str, default=None, help="Optional ground truth for metrics")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory for reconstructions and checkpoints")
@@ -33,27 +33,19 @@ def parse_args():
 
     # Training params
     parser.add_argument("--cone_width_deg", type=float, default=72.0)
+    parser.add_argument("--start_angle_deg", type=float, default=0.0)
     parser.add_argument("--patch_size", type=int, default=167)
     parser.add_argument("--volume_size", type=lambda s: (tuple(int(v) for v in s.split(",")) if "," in s else int(s)), default=96)
     parser.add_argument("--batch_size", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=50, help="Epochs for round 0")
     parser.add_argument("--finetune_epochs", type=int, default=10, help="Epochs for finetuning in round > 0")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--exp_name", type=str, default="isonet_iterative")
+    parser.add_argument("--exp_name", type=str, default="isonet_tr_iterative")
     parser.add_argument("--no_rotate", action="store_true")
-    parser.add_argument("--predict_residual", action="store_true",
-                        help="Train to predict x - carved_x; add carved_x back at inference.")
-    parser.add_argument("--scheduler_type", choices=["cosine_warmup", "cosine_restarts"],
-                        default="cosine_warmup")
-    parser.add_argument("--T_0", type=int, default=None,
-                        help="Epochs per restart for cosine_restarts (default: epochs for that round).")
-    parser.add_argument("--T_mult", type=int, default=1)
-    parser.add_argument("--model_type", choices=["unet3d", "dynunet", "ddwunet"], default="unet3d",
-                        help="Network architecture forwarded to train_isonet_3d.py.")
+    parser.add_argument("--model_type", choices=["unet3d", "dynunet"], default="unet3d",
+                        help="Network architecture forwarded to train_isonet_time_resolved.py.")
     parser.add_argument("--dynunet_filters", type=str, default="32,64,128,256,320",
                         help="Comma-separated DynUNet filter counts (used when --model_type dynunet).")
-    parser.add_argument("--ddwunet_chans", type=int, default=32,
-                        help="Base channel width for DDWUNet (used when --model_type ddwunet).")
 
     # Inference params
     parser.add_argument("--overlap", type=int, default=10)
@@ -63,11 +55,12 @@ def parse_args():
 
 
 def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetuning=False):
-    train_script = _PROJECT_ROOT / "isodiffusion" / "train_isonet_3d.py"
+    train_script = _PROJECT_ROOT / "isodiffusion" / "train_isonet_time_resolved.py"
     cmd = [
         sys.executable, str(train_script),
         "--data_path", str(data_path),
         "--cone_width_deg", str(args.cone_width_deg),
+        "--start_angle_deg", str(args.start_angle_deg),
         "--patch_size", str(args.patch_size),
         "--volume_size", ",".join(str(v) for v in args.volume_size) if isinstance(args.volume_size, (tuple, list)) else str(args.volume_size),
         "--batch_size", str(args.batch_size),
@@ -78,21 +71,11 @@ def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetun
     ]
     if args.no_rotate:
         cmd.append("--no_rotate")
-    if args.predict_residual:
-        cmd.append("--predict_residual")
-    cmd.extend(["--scheduler_type", args.scheduler_type])
-    if args.T_0 is not None:
-        cmd.extend(["--T_0", str(args.T_0)])
-    cmd.extend(["--T_mult", str(args.T_mult)])
     cmd.extend(["--model_type", args.model_type])
     if args.model_type == "dynunet":
         cmd.extend(["--dynunet_filters", args.dynunet_filters])
-    if args.model_type == "ddwunet":
-        cmd.extend(["--ddwunet_chans", str(args.ddwunet_chans)])
-    try:
+    if is_finetuning and Path(checkpoint_path).exists():
         cmd.extend(["--load_checkpoint", str(checkpoint_path)])
-    except:
-        print("model not found, starting from random initialization.")
 
     print(f"Running training: {' '.join(cmd)}")
     result = subprocess.run(cmd)
@@ -108,17 +91,15 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
         load_npy_volume,
         patch_starts,
     )
-    from isodiffusion.fourier_wedge import apply_missing_wedge, enforce_known_fourier
+    from isodiffusion.fourier_wedge import enforce_known_fourier_time_resolved
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _ = load_isonet3d(checkpoint_path, device=device)
     normalize_fn, denormalize_fn, norm_config = load_norm_fns_from_checkpoint_sidecar(checkpoint_path)
 
-    predict_residual = bool(norm_config.get("predict_residual", False))
     cone_width_deg = float(norm_config.get("cone_width_deg", 72.0))
     angular_range_deg = 180.0 - cone_width_deg
-    center = float(norm_config.get("carve_center_angle_deg", 0.0))
-    start_angle_deg = (center + cone_width_deg / 2.0) % 180.0
+    start_angle_deg = float(norm_config.get("start_angle_deg", 0.0))
     tilt_axis = int(norm_config.get("tilt_axis", 0))
     volume_size_raw = norm_config.get("volume_size", args.volume_size)
     if isinstance(volume_size_raw, (list, tuple)):
@@ -128,13 +109,7 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
     cross_attention_dim = int(norm_config.get("cross_attention_dim", 128))
 
     current_vol = load_npy_volume(current_vol_path)  # (D, H, W), raw values
-
-    # Carve the current volume to produce the model input, matching training
-    # carved_vol = apply_missing_wedge(current_vol, angular_range_deg, start_angle_deg, tilt_axis)
-    # carved_norm = normalize_fn(carved_vol)  # (D, H, W), normalized
-    
-    # no missing wedge is imposed before feeding it to the inference model, so input does not have a missing wedge (except from the firt round)
-    carved_norm = normalize_fn(current_vol)  # (D, H, W), normalized 
+    carved_norm = normalize_fn(current_vol)  # (D, H, W), normalized
 
     d, h, w = carved_norm.shape
     d_starts = patch_starts(d, patch_d, args.overlap)
@@ -175,12 +150,10 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
                 counts[d0:d0 + patch_d, h0:h0 + patch_h, w0:w0 + patch_w] += 1.0
 
     recon = output / counts.clamp_min(1.0)
-    if predict_residual:
-        recon = recon + torch.as_tensor(np.asarray(carved_norm), dtype=torch.float32)
     recon = denormalize_fn(recon)
 
-    # Enforce the known (non-missing-cone) Fourier components from the current volume
-    recon = enforce_known_fourier(
+    # Enforce per-slice Fourier consistency, matching the per-slice 2-D FFT carving used during training
+    recon = enforce_known_fourier_time_resolved(
         estimate_volume=recon,
         measured_volume=current_vol,
         angular_range_deg=angular_range_deg,
@@ -240,13 +213,13 @@ def main():
                 np.save(crop_gt_path, gt_vol[:c, :c, :c])
             gt_path = crop_gt_path
 
-    checkpoint_path = output_dir / "isonet_checkpoint_latest.pt"
+    checkpoint_path = output_dir / "isonet_tr_checkpoint_latest.pt"
     current_vol = data_path
 
     for rnd in range(args.num_rounds):
         print(f"\n{'='*50}\nStarting Round {rnd}\n{'='*50}")
 
-        recon_output_path = output_dir / f"isonet_reconstruction_round_{rnd}.npy"
+        recon_output_path = output_dir / f"isonet_tr_reconstruction_round_{rnd}.npy"
 
         if recon_output_path.exists():
             print(f"Reconstruction for round {rnd} already exists. Skipping.")

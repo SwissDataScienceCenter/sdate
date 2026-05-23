@@ -41,6 +41,7 @@ from pytorch_base.base_loss import BaseLoss
 from pytorch_base.experiment import PyTorchExperiment
 
 from isodiffusion.datasets import MissingConeVolumes
+from isodiffusion.volume_augmentation import VolumeAugmentor
 
 
 def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, float, float]:
@@ -155,6 +156,7 @@ class ConditionalIsoDiffusion2DLoss(BaseLoss):
         noise_scheduler: DDPMScheduler,
         device: torch.device,
         slice_batch_size: int,
+        augmentor: VolumeAugmentor,
         conditioning_probability: float = 0.5,
         loss_type: str = "huber",
     ) -> None:
@@ -167,6 +169,7 @@ class ConditionalIsoDiffusion2DLoss(BaseLoss):
         self.noise_scheduler = noise_scheduler
         self.device = device
         self.slice_batch_size = int(slice_batch_size)
+        self.augmentor = augmentor
         self.conditioning_probability = float(conditioning_probability)
 
         loss_type = loss_type.lower()
@@ -226,11 +229,12 @@ class ConditionalIsoDiffusion2DLoss(BaseLoss):
         return carved_slices.contiguous(), x_slices.contiguous()
 
     def compute_loss(self, instance, model: UNet2DModel):
-        carved_x, x_0 = instance
+        x_raw = instance.float().to(self.device, non_blocking=True)
+        carved_x, x_0 = self.augmentor(x_raw)
         carved_x, x_0 = self._sample_axial_slices(carved_x, x_0)
 
-        x_0 = x_0.float().unsqueeze(1).to(self.device, non_blocking=True)
-        carved_x = carved_x.float().unsqueeze(1).to(self.device, non_blocking=True)
+        x_0 = x_0.float().unsqueeze(1)
+        carved_x = carved_x.float().unsqueeze(1)
 
         noise = torch.randn_like(x_0)
         bsz = x_0.shape[0]
@@ -304,6 +308,12 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument(
+        "--save_checkpoint",
+        type=str,
+        default="",
+        help="Override checkpoint save path (default: checkpoints/ddpm_isodiffusion2d_{exp_name}.pt).",
+    )
+    parser.add_argument(
         "--mixed_precision",
         choices=["no", "fp16", "bf16", "auto"],
         default="fp16",
@@ -364,9 +374,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     train_ds, test_ds, norm_min, norm_max = build_datasets(args)
+    augmentor = VolumeAugmentor(train_ds)
 
     os.makedirs("samples", exist_ok=True)
-    carved_sample, x_sample = train_ds[0]
+    with torch.no_grad():
+        carved_sample, x_sample = augmentor(train_ds[0].unsqueeze(0))
+    carved_sample, x_sample = carved_sample[0], x_sample[0]
     mid = x_sample.shape[0] // 2
     TF.to_pil_image(x_sample[mid].clamp(0, 1)).save(f"samples/sample_x_{args.exp_name}.png")
     TF.to_pil_image(carved_sample[mid].clamp(0, 1)).save(
@@ -378,8 +391,12 @@ def main() -> None:
     )
 
     model = create_model(args)
-    os.makedirs("checkpoints", exist_ok=True)
-    checkpoint_path = f"checkpoints/ddpm_isodiffusion2d_{args.exp_name}.pt"
+    if args.save_checkpoint:
+        checkpoint_path = args.save_checkpoint
+        os.makedirs(Path(checkpoint_path).parent, exist_ok=True)
+    else:
+        os.makedirs("checkpoints", exist_ok=True)
+        checkpoint_path = f"checkpoints/ddpm_isodiffusion2d_{args.exp_name}.pt"
     norm_config_path = checkpoint_path.replace(".pt", "_norm.json")
     with open(norm_config_path, "w") as f:
         json.dump(
@@ -423,6 +440,7 @@ def main() -> None:
         noise_scheduler,
         device,
         slice_batch_size=args.batch_size,
+        augmentor=augmentor,
         conditioning_probability=args.conditioning_probability,
         loss_type=args.loss_type,
     )

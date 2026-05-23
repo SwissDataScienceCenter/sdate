@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -172,15 +172,29 @@ def load_unet2d(
 def create_isonet3d_from_config(config: Dict):
     """Create the 3D UNet used by train_isonet_3d (single-channel direct regression).
 
-    When ``config["arch"] == "dynunet"`` the MONAI DynUNetIsoNet wrapper is
-    returned instead.
+    Dispatches on ``config["arch"]``:
+    - ``"unet3d"`` (default): diffusers UNet3DConditionModel
+    - ``"dynunet"``: MONAI DynUNetIsoNet wrapper
+    - ``"ddwunet"``: DeepDeWedge DDWUNetIsoNet wrapper
     """
-    if config.get("arch", "unet3d") == "dynunet":
+    arch = config.get("arch", "unet3d")
+
+    if arch == "dynunet":
         from isodiffusion.dynunet_wrapper import DynUNetIsoNet, parse_dynunet_filters
         filters = parse_dynunet_filters(
             config.get("dynunet_filters", [64, 128, 256, 384, 512])
         )
         return DynUNetIsoNet(in_channels=1, out_channels=1, filters=filters)
+
+    if arch == "ddwunet":
+        from isodiffusion.ddwunet_wrapper import DDWUNetIsoNet
+        # normalization_loc / normalization_scale will be overridden by the
+        # checkpoint state_dict; defaults here are just placeholders.
+        return DDWUNetIsoNet(
+            chans=int(config.get("ddwunet_chans", 32)),
+            normalization_loc=float(config.get("ddwunet_norm_loc", 0.0)),
+            normalization_scale=float(config.get("ddwunet_norm_scale", 1.0)),
+        )
 
     channels = _parse_channels(config.get("channels", _ISONET_3D_DEFAULT_CHANNELS))
     expected_blocks = len(_ISONET_3D_DOWN_BLOCK_TYPES)

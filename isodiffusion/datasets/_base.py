@@ -10,7 +10,6 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 VolumeSize = Union[int, Tuple[int, int, int]]
@@ -54,63 +53,6 @@ def _normalize_volume(volume: np.ndarray, norm_min: float, norm_max: float) -> t
         volume = volume - norm_min
     return torch.from_numpy(np.ascontiguousarray(volume.astype(np.float32)))
 
-
-def _random_rotation_matrix() -> torch.Tensor:
-    """Uniform random SO(3) rotation matrix from a random unit quaternion."""
-    u1, u2, u3 = torch.rand(3)
-    q1 = torch.sqrt(1.0 - u1) * torch.sin(2.0 * math.pi * u2)
-    q2 = torch.sqrt(1.0 - u1) * torch.cos(2.0 * math.pi * u2)
-    q3 = torch.sqrt(u1) * torch.sin(2.0 * math.pi * u3)
-    q4 = torch.sqrt(u1) * torch.cos(2.0 * math.pi * u3)
-    x, y, z, w = q1, q2, q3, q4
-
-    return torch.tensor(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ],
-        dtype=torch.float32,
-    )
-
-
-def _rotate_volume(volume: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
-    """Rotate a ``(D, H, W)`` tensor around its center using trilinear sampling."""
-    if volume.ndim != 3:
-        raise ValueError(f"Expected a 3D tensor, got shape {tuple(volume.shape)}")
-    theta = torch.zeros((1, 3, 4), dtype=volume.dtype, device=volume.device)
-    theta[0, :, :3] = rotation.to(device=volume.device, dtype=volume.dtype).T
-    grid = F.affine_grid(
-        theta,
-        size=(1, 1, *volume.shape),
-        align_corners=True,
-    )
-    rotated = F.grid_sample(
-        volume.unsqueeze(0).unsqueeze(0),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )
-    return rotated.squeeze(0).squeeze(0)
-
-
-def _center_crop_cube(volume: torch.Tensor, size: int) -> torch.Tensor:
-    d, h, w = volume.shape
-    if min(d, h, w) < size:
-        raise ValueError(f"Cannot crop size {size} from volume shape {tuple(volume.shape)}")
-    z0 = (d - size) // 2
-    y0 = (h - size) // 2
-    x0 = (w - size) // 2
-    return volume[z0 : z0 + size, y0 : y0 + size, x0 : x0 + size].contiguous()
-
-
-def _random_depth_crop(volume: torch.Tensor, target_d: int) -> torch.Tensor:
-    d = volume.shape[0]
-    if d < target_d:
-        raise ValueError(f"Cannot depth-crop {target_d} from shape {tuple(volume.shape)}")
-    z0 = int(torch.randint(0, d - target_d + 1, (1,)).item()) if d > target_d else 0
-    return volume[z0 : z0 + target_d].contiguous()
 
 
 class BaseVolumeDataset(Dataset):
@@ -232,22 +174,13 @@ class BaseVolumeDataset(Dataset):
     def __len__(self) -> int:
         return int(self._cumulative[-1])
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> torch.Tensor:
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range for dataset of length {len(self)}")
-
         file_idx = int(np.searchsorted(self._cumulative[1:], idx, side="right"))
-        raw_patch = self._sample_patch(self._load_volume(file_idx))
-        patch = _normalize_volume(raw_patch, self.norm_min, self.norm_max)
-
-        if self.rotate:
-            patch = _rotate_volume(patch, _random_rotation_matrix())
-
-        x = _center_crop_cube(patch, self._cube_size)
-        if self._is_slab:
-            x = _random_depth_crop(x, self.target_size[0])
-        carved_x = self._carve_wedge(x)
-        return carved_x.contiguous(), x.contiguous()
+        return _normalize_volume(
+            self._sample_patch(self._load_volume(file_idx)), self.norm_min, self.norm_max
+        )
 
     @property
     def num_files(self) -> int:

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Train a 3D IsoNet for missing-wedge recovery via direct regression.
+"""Train a 3D IsoNet for time-resolved missing-wedge recovery via direct regression.
 
-The model takes a single-channel normalized carved volume patch as input and
-directly predicts the normalized full volume patch. Loss: MSE(normalize(x), model(normalize(carved_x))).
-
-Unlike the diffusion counterpart, there is no noise schedule — the UNet3DConditionModel
-is reused with in_channels=1, timestep=0, and zero encoder_hidden_states.
+Identical to ``train_isonet_3d.py`` but uses ``TimeResolvedVolumes`` instead of
+``MissingConeVolumes``.  Each axial slice gets its own Fourier mask that rotates by
+``angular_range_deg`` relative to the previous slice, matching a time-resolved
+acquisition where each frame covers a different angular range of the tilt series.
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ for _candidate in (Path("/myhome/BaseTraining"), Path("/myhome/sdsc"), Path("/my
 
 from pytorch_base.base_loss import BaseLoss
 from pytorch_base.experiment import PyTorchExperiment
-from isodiffusion.datasets import MissingConeVolumes
+from isodiffusion.datasets.time_resolved_dataset import TimeResolvedVolumes
 from isodiffusion.volume_augmentation import VolumeAugmentor
 
 
@@ -44,28 +43,28 @@ def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dat
     if args.norm_min is not None and args.norm_max is not None:
         normalize_range = (args.norm_min, args.norm_max)
 
-    ds_train = MissingConeVolumes(
+    ds_train = TimeResolvedVolumes(
         data_path=Path(args.data_path),
         cone_width_deg=args.cone_width_deg,
         patch_size=args.patch_size,
         target_size=args.volume_size,
         normalize_range=normalize_range,
         samples_per_volume=args.samples_per_volume,
-        carve_center_angle_deg=args.carve_center_angle_deg,
+        start_angle_deg=args.start_angle_deg,
         tilt_axis=args.tilt_axis,
         rotate=not args.no_rotate,
     )
     norm_min = ds_train.norm_min
     norm_max = ds_train.norm_max
 
-    ds_test = MissingConeVolumes(
+    ds_test = TimeResolvedVolumes(
         data_path=Path(args.data_path),
         cone_width_deg=args.cone_width_deg,
         patch_size=args.patch_size,
         target_size=args.volume_size,
         normalize_range=(norm_min, norm_max),
         samples_per_volume=args.samples_per_volume,
-        carve_center_angle_deg=args.carve_center_angle_deg,
+        start_angle_deg=args.start_angle_deg,
         tilt_axis=args.tilt_axis,
         rotate=not args.no_rotate,
     )
@@ -119,10 +118,6 @@ def create_model(args):
         filters = parse_dynunet_filters(args.dynunet_filters)
         return DynUNetIsoNet(in_channels=1, out_channels=1, filters=filters)
 
-    if args.model_type == "ddwunet":
-        from isodiffusion.ddwunet_wrapper import DDWUNetIsoNet
-        return DDWUNetIsoNet(chans=args.ddwunet_chans)
-
     return UNet3DConditionModel(
         sample_size=list(args.volume_size)[-2:] if isinstance(args.volume_size, tuple) else args.volume_size,
         in_channels=1,
@@ -138,18 +133,13 @@ def create_model(args):
 
 
 class IsoNetLoss(BaseLoss):
-    """Direct regression loss.
+    """Direct regression loss: MSE(normalize(x), model(normalize(carved_x)))."""
 
-    Default: MSE(model(normalize(carved_x)), normalize(x)).
-    With predict_residual: MSE(model(normalize(carved_x)), normalize(x) - normalize(carved_x)).
-    """
-
-    def __init__(self, device: torch.device, cross_attention_dim: int, augmentor: VolumeAugmentor, loss_type: str = "huber", predict_residual: bool = False) -> None:
+    def __init__(self, device: torch.device, cross_attention_dim: int, augmentor: VolumeAugmentor, loss_type: str = "huber") -> None:
         super().__init__(["loss"])
         self.device = device
         self.cross_attention_dim = int(cross_attention_dim)
         self.augmentor = augmentor
-        self.predict_residual = predict_residual
         loss_type = loss_type.lower()
         if loss_type == "mae":
             self.loss_fn = nn.L1Loss()
@@ -179,13 +169,12 @@ class IsoNetLoss(BaseLoss):
             return_dict=False,
         )[0]
 
-        target = x - carved_x if self.predict_residual else x
-        loss = self.loss_fn(pred, target)
+        loss = self.loss_fn(pred, x)
         return loss, {"loss": loss.detach()}
 
 
 def parse_args():
-    parser = ArgumentParser(description="Train 3D IsoNet (direct regression) for missing-wedge recovery.")
+    parser = ArgumentParser(description="Train 3D IsoNet (direct regression) for time-resolved missing-wedge recovery.")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--cone_width_deg", type=float, required=True)
     parser.add_argument("--norm_min", type=float, default=None)
@@ -193,7 +182,7 @@ def parse_args():
     parser.add_argument("--patch_size", type=int, default=112)
     parser.add_argument("--volume_size", type=_parse_volume_size, default=64)
     parser.add_argument("--samples_per_volume", type=int, default=None)
-    parser.add_argument("--carve_center_angle_deg", type=float, default=0.0)
+    parser.add_argument("--start_angle_deg", type=float, default=0.0)
     parser.add_argument("--tilt_axis", type=int, default=0)
     parser.add_argument("--no_rotate", action="store_true")
     parser.add_argument("--test_fraction", type=float, default=0.1)
@@ -205,22 +194,13 @@ def parse_args():
     parser.add_argument("--scheduler", type=str, default="[50000000]")
     parser.add_argument("--lr_decay", type=float, default=0.1)
     parser.add_argument("--warmup_steps", type=int, default=500)
-    parser.add_argument("--scheduler_type", choices=["cosine_warmup", "cosine_restarts"],
-                        default="cosine_warmup",
-                        help="LR scheduler. 'cosine_warmup': single cosine cycle with linear warmup (default). "
-                             "'cosine_restarts': CosineAnnealingWarmRestarts — periodically resets LR to escape "
-                             "LR-induced plateaus without restarting the optimizer.")
-    parser.add_argument("--T_0", type=int, default=None,
-                        help="Epochs per restart for cosine_restarts (default: --epochs, i.e. one restart total).")
-    parser.add_argument("--T_mult", type=int, default=1,
-                        help="Restart period multiplier for cosine_restarts (default: 1, constant period).")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--exp_name", type=str, default="isonet3d")
+    parser.add_argument("--exp_name", type=str, default="isonet3d_tr")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--loss_type", choices=["mae", "mse", "huber"], default="mae")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--model_type", choices=["unet3d", "dynunet", "ddwunet"], default="unet3d",
-                        help="Network architecture: unet3d (diffusers), dynunet (MONAI), or ddwunet (DeepDeWedge).")
+    parser.add_argument("--model_type", choices=["unet3d", "dynunet"], default="unet3d",
+                        help="Network architecture: unet3d (diffusers) or dynunet (MONAI).")
     parser.add_argument("--channels", type=_parse_channels, default=(32, 64, 128))
     parser.add_argument("--layers_per_block", type=int, default=1)
     parser.add_argument("--norm_num_groups", type=int, default=16)
@@ -228,10 +208,6 @@ def parse_args():
     parser.add_argument("--attention_head_dim", type=int, default=8)
     parser.add_argument("--dynunet_filters", type=str, default="32,64,128,256,320",
                         help="Comma-separated filter counts per DynUNet level (used when --model_type dynunet).")
-    parser.add_argument("--ddwunet_chans", type=int, default=32,
-                        help="Base channel width for DDWUNet (used when --model_type ddwunet).")
-    parser.add_argument("--predict_residual", action="store_true",
-                        help="Train to predict x - carved_x; at inference add carved_x back to recover x.")
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument("--save_checkpoint", type=str, default="", help="Absolute path to save the checkpoint.")
     parser.add_argument("--mixed_precision", choices=["no", "fp16", "bf16", "auto"], default="fp16")
@@ -272,19 +248,13 @@ def main() -> None:
 
     model = create_model(args)
 
-    if args.model_type == "ddwunet":
-        from isodiffusion.ddwunet_wrapper import compute_ddwunet_normalization_stats
-        ddw_loc, ddw_scale = compute_ddwunet_normalization_stats(train_ds, num_samples=min(200, len(train_ds)))
-        model.unet.normalization_loc = ddw_loc
-        model.unet.normalization_scale = ddw_scale
-        print(f"DDWUNet normalization: loc={ddw_loc:.6f}, scale={ddw_scale:.6f}")
-
     norm_config_path = checkpoint_path.replace(".pt", "_norm.json")
     with open(norm_config_path, "w") as f:
         from isodiffusion.dynunet_wrapper import parse_dynunet_filters
         json.dump(
             {
                 "model_type": "isonet",
+                "dataset_mode": "time_resolved",
                 "arch": args.model_type,
                 "in_channels": 1,
                 "norm_min": norm_min,
@@ -292,7 +262,7 @@ def main() -> None:
                 "cone_width_deg": args.cone_width_deg,
                 "patch_size": args.patch_size,
                 "volume_size": list(args.volume_size) if isinstance(args.volume_size, tuple) else args.volume_size,
-                "carve_center_angle_deg": args.carve_center_angle_deg,
+                "start_angle_deg": args.start_angle_deg,
                 "tilt_axis": args.tilt_axis,
                 # unet3d params
                 "channels": list(args.channels),
@@ -302,11 +272,6 @@ def main() -> None:
                 "attention_head_dim": args.attention_head_dim,
                 # dynunet params
                 "dynunet_filters": parse_dynunet_filters(args.dynunet_filters) if args.model_type == "dynunet" else None,
-                # ddwunet params
-                "ddwunet_chans": args.ddwunet_chans if args.model_type == "ddwunet" else None,
-                "ddwunet_norm_loc": model.unet.normalization_loc if args.model_type == "ddwunet" else None,
-                "ddwunet_norm_scale": model.unet.normalization_scale if args.model_type == "ddwunet" else None,
-                "predict_residual": args.predict_residual,
             },
             f,
             indent=2,
@@ -322,7 +287,6 @@ def main() -> None:
             print(f"Could not load checkpoint {args.load_checkpoint}: {exc}. Training from scratch.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
     model.to(device)
 
     if args.enable_xformers:
@@ -332,7 +296,7 @@ def main() -> None:
         except Exception as exc:
             print(f"xFormers could not be enabled: {exc}")
 
-    loss_fn = IsoNetLoss(device, cross_attention_dim=model.config.cross_attention_dim, augmentor=augmentor, loss_type=args.loss_type, predict_residual=args.predict_residual)
+    loss_fn = IsoNetLoss(device, cross_attention_dim=model.config.cross_attention_dim, augmentor=augmentor, loss_type=args.loss_type)
 
     exp = PyTorchExperiment(
         args=vars(args),
@@ -362,20 +326,11 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
     total_steps = len(exp.train_loader) * args.epochs
-    if args.scheduler_type == "cosine_restarts":
-        T_0_steps = (args.T_0 if args.T_0 is not None else args.epochs) * len(exp.train_loader)
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer=optimizer,
-            T_0=T_0_steps,
-            T_mult=args.T_mult,
-            eta_min=0.0,
-        )
-    else:
-        lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=args.warmup_steps,
-            num_training_steps=total_steps,
-        )
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=total_steps,
+    )
 
     exp.train(args.epochs, optimizer, milestones=milestones, gamma=args.lr_decay, scheduler=lr_scheduler)
 

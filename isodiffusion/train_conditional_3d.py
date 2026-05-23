@@ -40,6 +40,7 @@ from pytorch_base.base_loss import BaseLoss
 from pytorch_base.experiment import PyTorchExperiment
 
 from isodiffusion.datasets import MissingConeVolumes
+from isodiffusion.volume_augmentation import VolumeAugmentor
 
 
 def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, float, float]:
@@ -177,12 +178,14 @@ class ConditionalIsoDiffusionLoss(BaseLoss):
         noise_scheduler: DDPMScheduler,
         device: torch.device,
         cross_attention_dim: int,
+        augmentor: VolumeAugmentor,
         loss_type: str = "huber",
     ) -> None:
         super().__init__(["loss"])
         self.noise_scheduler = noise_scheduler
         self.device = device
         self.cross_attention_dim = int(cross_attention_dim)
+        self.augmentor = augmentor
         loss_type = loss_type.lower()
         if loss_type == "mae":
             self.loss = nn.L1Loss()
@@ -194,17 +197,10 @@ class ConditionalIsoDiffusionLoss(BaseLoss):
             raise ValueError("loss_type must be one of: mae, mse, huber")
 
     def compute_loss(self, instance, model: UNet3DConditionModel):
-        carved_x, x_0 = instance
-
-        if x_0.dim() == 4:
-            x_0 = x_0.unsqueeze(1)
-        if carved_x.dim() == 4:
-            carved_x = carved_x.unsqueeze(1)
-
-        # non_blocking=True pairs with PyTorchExperiment(pin_memory=True) so
-        # host-to-GPU copies can overlap with CUDA work when possible.
-        x_0 = x_0.float().to(self.device, non_blocking=True)
-        carved_x = carved_x.float().to(self.device, non_blocking=True)
+        x_raw = instance.float().to(self.device, non_blocking=True)
+        carved_x, x_0 = self.augmentor(x_raw)
+        x_0 = x_0.unsqueeze(1)
+        carved_x = carved_x.unsqueeze(1)
 
         noise = torch.randn_like(x_0)
         bsz = x_0.shape[0]
@@ -335,9 +331,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     train_ds, test_ds, norm_min, norm_max = build_datasets(args)
+    augmentor = VolumeAugmentor(train_ds)
 
     os.makedirs("samples", exist_ok=True)
-    carved_sample, x_sample = train_ds[0]
+    with torch.no_grad():
+        carved_sample, x_sample = augmentor(train_ds[0].unsqueeze(0))
+    carved_sample, x_sample = carved_sample[0], x_sample[0]
     mid = x_sample.shape[0] // 2
     TF.to_pil_image(x_sample[mid].clamp(0, 1)).save(f"samples/sample_x_{args.exp_name}.png")
     TF.to_pil_image(carved_sample[mid].clamp(0, 1)).save(
@@ -403,6 +402,7 @@ def main() -> None:
         noise_scheduler,
         device,
         cross_attention_dim=model.config.cross_attention_dim,
+        augmentor=augmentor,
         loss_type=args.loss_type,
     )
 
