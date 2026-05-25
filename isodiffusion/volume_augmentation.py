@@ -36,19 +36,11 @@ def _random_rotation_matrices(
     return torch.stack(rows, dim=1).reshape(batch_size, 3, 3).to(dtype=dtype)
 
 
-def rotate_patches(patches: torch.Tensor) -> torch.Tensor:
-    """Apply independent uniform SO(3) rotations to each patch in a batch.
-
-    Args:
-        patches: ``(B, D, H, W)`` float tensor on any device.
-
-    Returns:
-        ``(B, D, H, W)`` rotated tensor, same device and dtype.
-    """
+def _apply_rotation_matrices(patches: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
+    """Apply pre-computed ``(B, 3, 3)`` rotation matrices to a ``(B, D, H, W)`` batch."""
     B, D, H, W = patches.shape
-    R = _random_rotation_matrices(B, patches.device, patches.dtype)
     theta = torch.zeros(B, 3, 4, device=patches.device, dtype=patches.dtype)
-    theta[:, :, :3] = R.transpose(1, 2)  # affine_grid expects R^T for rotation
+    theta[:, :, :3] = R.to(device=patches.device, dtype=patches.dtype).transpose(1, 2)
     grid = F.affine_grid(theta, size=(B, 1, D, H, W), align_corners=True)
     rotated = F.grid_sample(
         patches.unsqueeze(1),
@@ -58,6 +50,45 @@ def rotate_patches(patches: torch.Tensor) -> torch.Tensor:
         align_corners=True,
     )
     return rotated.squeeze(1)
+
+
+def rotate_mask(mask: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
+    """Apply per-sample rotations to a (D, H, W) boolean mask.
+
+    Args:
+        mask: ``(D, H, W)`` bool tensor.
+        R: ``(B, 3, 3)`` rotation matrices (same as used for the volume).
+
+    Returns:
+        ``(B, D, H, W)`` bool tensor — nearest-neighbour interpolation preserves
+        the binary structure of the mask.
+    """
+    B = R.shape[0]
+    D, H, W = mask.shape
+    theta = torch.zeros(B, 3, 4, device=mask.device, dtype=torch.float32)
+    theta[:, :, :3] = R.to(device=mask.device, dtype=torch.float32).transpose(1, 2)
+    grid = F.affine_grid(theta, size=(B, 1, D, H, W), align_corners=True)
+    rotated = F.grid_sample(
+        mask.float().unsqueeze(0).unsqueeze(0).expand(B, 1, D, H, W),
+        grid,
+        mode="nearest",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return rotated.squeeze(1).bool()  # (B, D, H, W)
+
+
+def rotate_patches(patches: torch.Tensor) -> torch.Tensor:
+    """Apply independent uniform SO(3) rotations to each patch in a batch.
+
+    Args:
+        patches: ``(B, D, H, W)`` float tensor on any device.
+
+    Returns:
+        ``(B, D, H, W)`` rotated tensor, same device and dtype.
+    """
+    R = _random_rotation_matrices(patches.shape[0], patches.device, patches.dtype)
+    return _apply_rotation_matrices(patches, R)
 
 
 def center_crop_cube(patches: torch.Tensor, size: int) -> torch.Tensor:
@@ -108,19 +139,43 @@ class VolumeAugmentor:
         self._target_d: int = base.target_size[0] if base._is_slab else 0
         self.rotate: bool = base.rotate
 
-    def __call__(self, patches: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(self, patches) -> Tuple[torch.Tensor, torch.Tensor, "Optional[torch.Tensor]"]:
         """Rotate, crop, and carve a batch of raw patches.
 
         Args:
-            patches: ``(B, patch_size, patch_size, patch_size)`` on any device.
+            patches: either ``(B, patch_size, patch_size, patch_size)`` tensor, or a
+                ``(v0_batch, v1_batch)`` tuple of two such tensors (dual-source mode).
+                In dual-source mode the same rotation is applied to both batches,
+                the wedge is carved only from v0, and v1 is returned as the target.
 
         Returns:
-            ``(carved_x, x)`` — both ``(B, *target_size)`` on the same device.
+            ``(carved_x, x, R)`` — both volumes are ``(B, *target_size)`` on the same
+            device; ``R`` is the ``(B, 3, 3)`` rotation matrix batch used, or ``None``
+            when ``rotate=False``.
         """
+        if isinstance(patches, (list, tuple)):
+            v0, v1 = patches
+            R = None
+            if self.rotate:
+                R = _random_rotation_matrices(v0.shape[0], v0.device, v0.dtype)
+                v0 = _apply_rotation_matrices(v0, R)
+                v1 = _apply_rotation_matrices(v1, R)
+            x0 = center_crop_cube(v0, self._cube_size)
+            x1 = center_crop_cube(v1, self._cube_size)
+            if self._is_slab:
+                D = x0.shape[1]
+                z0 = int(torch.randint(0, D - self._target_d + 1, (1,)).item()) if D > self._target_d else 0
+                x0 = x0[:, z0:z0 + self._target_d].contiguous()
+                x1 = x1[:, z0:z0 + self._target_d].contiguous()
+            carved_x = torch.stack([self._carve_wedge(x0[i]) for i in range(x0.shape[0])])
+            return carved_x.contiguous(), x1.contiguous(), R
+
+        R = None
         if self.rotate:
-            patches = rotate_patches(patches)
+            R = _random_rotation_matrices(patches.shape[0], patches.device, patches.dtype)
+            patches = _apply_rotation_matrices(patches, R)
         x = center_crop_cube(patches, self._cube_size)
         if self._is_slab:
             x = random_depth_crop(x, self._target_d)
         carved_x = torch.stack([self._carve_wedge(x[i]) for i in range(x.shape[0])])
-        return carved_x.contiguous(), x.contiguous()
+        return carved_x.contiguous(), x.contiguous(), R

@@ -3,8 +3,8 @@
 ``MissingConeVolumes`` loads one or more 3D ``.npy`` volumes, samples a random
 ``patch_size`` cube, applies an arbitrary 3D rotation, carves an additional fixed
 missing wedge, then center-crops to ``target_size`` to remove rotation boundary
-artifacts.  Each item is ``(carved_x, x)`` where both tensors are normalized
-``float32`` volumes with shape ``(target_size, target_size, target_size)``.
+artifacts.  Each item is a normalized ``float32`` patch; see ``BaseVolumeDataset``
+for the optional ``target_path`` dual-source mode.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from ._base import BaseVolumeDataset, VolumeSize
 
 
 class MissingConeVolumes(BaseVolumeDataset):
-    """Dataset of ``(carved_x, x)`` 3D conditional diffusion training pairs.
+    """Dataset of raw volume patches for missing-wedge training.
 
     A fixed missing wedge of ``cone_width_deg`` is carved from every patch in
     the same orientation, controlled by ``carve_center_angle_deg``.
@@ -37,6 +37,7 @@ class MissingConeVolumes(BaseVolumeDataset):
         carve_center_angle_deg: float = 0.0,
         tilt_axis: int = 0,
         rotate: bool = True,
+        target_path: Optional[Union[str, Path]] = None,
     ) -> None:
         self.carve_center_angle_deg = float(carve_center_angle_deg)
         super().__init__(
@@ -48,6 +49,7 @@ class MissingConeVolumes(BaseVolumeDataset):
             samples_per_volume=samples_per_volume,
             tilt_axis=tilt_axis,
             rotate=rotate,
+            target_path=target_path,
         )
 
     def _carve_wedge(self, volume: torch.Tensor) -> torch.Tensor:
@@ -66,5 +68,6 @@ class MissingConeVolumes(BaseVolumeDataset):
             f"files={self.num_files}, total_samples={len(self)}, "
             f"patch_size={self.patch_size}, target_size={self.target_size}, "
             f"cone_width_deg={self.cone_width_deg:.1f}, tilt_axis={self.tilt_axis}, "
-            f"norm=[{self.norm_min:.4g}, {self.norm_max:.4g}], rotate={self.rotate})"
+            f"norm=[{self.norm_min:.4g}, {self.norm_max:.4g}], rotate={self.rotate}, "
+            f"frozen_target={self._target_files is not None})"
         )

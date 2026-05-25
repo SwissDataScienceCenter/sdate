@@ -62,6 +62,13 @@ class BaseVolumeDataset(Dataset):
     for slab-shaped patches where ``D <= H == W``.  The pipeline always first
     center-crops a ``H^3`` cube (after optional rotation), then takes a random
     depth crop of size ``D`` from that cube.
+
+    When ``target_path`` is provided the dataset loads a second frozen set of
+    volumes (v1) alongside the main v0 volumes.  ``__getitem__`` then returns
+    ``(v0_patch, v1_patch)`` where both patches are sampled from the exact same
+    spatial location.  The wedge is carved only from v0 by ``VolumeAugmentor``;
+    v1 is passed through as the stable supervision target.  When ``target_path``
+    is ``None`` the behaviour is identical to the original single-source dataset.
     """
 
     def __init__(
@@ -74,6 +81,7 @@ class BaseVolumeDataset(Dataset):
         samples_per_volume: Optional[int] = None,
         tilt_axis: int = 0,
         rotate: bool = True,
+        target_path: Optional[Union[str, Path]] = None,
     ) -> None:
         self.data_path = Path(data_path)
         self.files = _resolve_npy_files(self.data_path)
@@ -150,22 +158,56 @@ class BaseVolumeDataset(Dataset):
         self._samples_per_file = counts
         self._cumulative = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
 
+        self._target_files: Optional[List[Path]] = None
+        self._target_volumes: Optional[List[Optional[np.ndarray]]] = None
+
+        if target_path is not None:
+            target_path = Path(target_path)
+            self._target_files = _resolve_npy_files(target_path)
+            if len(self._target_files) != len(self.files):
+                raise ValueError(
+                    f"target_path has {len(self._target_files)} .npy file(s) but "
+                    f"data_path has {len(self.files)}; counts must match"
+                )
+            self._target_volumes = [None] * len(self._target_files)
+            for i, tf in enumerate(self._target_files):
+                tvol = np.load(str(tf)).astype(np.float32)
+                if tvol.shape != self._shapes[i]:
+                    raise ValueError(
+                        f"Target volume {tf} shape {tvol.shape} does not match "
+                        f"source volume {self.files[i]} shape {self._shapes[i]}"
+                    )
+                self._target_volumes[i] = tvol
+            print(
+                f"{self.__class__.__name__}: loaded {len(self._target_files)} frozen "
+                f"target volume(s) from {target_path}"
+            )
+
     def _load_volume(self, file_idx: int) -> np.ndarray:
         if self._volumes[file_idx] is None:
             self._volumes[file_idx] = np.load(str(self.files[file_idx])).astype(np.float32)
         return self._volumes[file_idx]  # type: ignore[return-value]
 
-    def _sample_patch(self, volume: np.ndarray) -> np.ndarray:
+    def _load_target_volume(self, file_idx: int) -> np.ndarray:
+        return self._target_volumes[file_idx]  # type: ignore[index,return-value]
+
+    def _sample_patch_coords(self, volume: np.ndarray) -> Tuple[int, int, int]:
         starts = []
         for dim in volume.shape:
             max_start = dim - self.patch_size
             starts.append(int(torch.randint(0, max_start + 1, (1,)).item()))
-        z0, y0, x0 = starts
+        return tuple(starts)  # type: ignore[return-value]
+
+    def _sample_patch_at(self, volume: np.ndarray, coords: Tuple[int, int, int]) -> np.ndarray:
+        z0, y0, x0 = coords
         return volume[
             z0 : z0 + self.patch_size,
             y0 : y0 + self.patch_size,
             x0 : x0 + self.patch_size,
         ]
+
+    def _sample_patch(self, volume: np.ndarray) -> np.ndarray:
+        return self._sample_patch_at(volume, self._sample_patch_coords(volume))
 
     @abstractmethod
     def _carve_wedge(self, volume: torch.Tensor) -> torch.Tensor:
@@ -174,13 +216,21 @@ class BaseVolumeDataset(Dataset):
     def __len__(self) -> int:
         return int(self._cumulative[-1])
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int):
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of range for dataset of length {len(self)}")
         file_idx = int(np.searchsorted(self._cumulative[1:], idx, side="right"))
-        return _normalize_volume(
-            self._sample_patch(self._load_volume(file_idx)), self.norm_min, self.norm_max
-        )
+        v0_vol = self._load_volume(file_idx)
+        coords = self._sample_patch_coords(v0_vol)
+        v0_patch = _normalize_volume(self._sample_patch_at(v0_vol, coords), self.norm_min, self.norm_max)
+        if self._target_files is not None:
+            v1_patch = _normalize_volume(
+                self._sample_patch_at(self._load_target_volume(file_idx), coords),
+                self.norm_min,
+                self.norm_max,
+            )
+            return v0_patch, v1_patch
+        return v0_patch
 
     @property
     def num_files(self) -> int:

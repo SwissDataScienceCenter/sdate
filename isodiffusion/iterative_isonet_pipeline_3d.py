@@ -25,6 +25,10 @@ def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description="Iterative 3D IsoNet Pipeline")
     parser.add_argument("--data_path", type=str, required=True, help="Starting volume (measured/conditioned)")
+    parser.add_argument("--target_path", type=str, default=None,
+                        help="Frozen v1 target volume, same shape as --data_path. "
+                             "Passed unchanged to every training round so the "
+                             "supervision target does not drift.")
     parser.add_argument("--ground_truth_path", type=str, default=None, help="Optional ground truth for metrics")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory for reconstructions and checkpoints")
 
@@ -43,6 +47,10 @@ def parse_args():
     parser.add_argument("--no_rotate", action="store_true")
     parser.add_argument("--predict_residual", action="store_true",
                         help="Train to predict x - carved_x; add carved_x back at inference.")
+    parser.add_argument("--fourier_loss_weight", type=float, default=1.0,
+                        help="Weight for the Fourier-space log-magnitude loss in the missing wedge (0 to disable).")
+    parser.add_argument("--fourier_mse_weight", type=float, default=1.0,
+                        help="Weight for the phase MSE term relative to the log-magnitude term (0 to disable).")
     parser.add_argument("--scheduler_type", choices=["cosine_warmup", "cosine_restarts"],
                         default="cosine_warmup")
     parser.add_argument("--T_0", type=int, default=None,
@@ -76,6 +84,8 @@ def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetun
         "--exp_name", args.exp_name,
         "--save_checkpoint", str(checkpoint_path),
     ]
+    if args.target_path:
+        cmd.extend(["--target_path", str(args.target_path)])
     if args.no_rotate:
         cmd.append("--no_rotate")
     if args.predict_residual:
@@ -89,6 +99,8 @@ def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetun
         cmd.extend(["--dynunet_filters", args.dynunet_filters])
     if args.model_type == "ddwunet":
         cmd.extend(["--ddwunet_chans", str(args.ddwunet_chans)])
+    cmd.extend(["--fourier_loss_weight", str(args.fourier_loss_weight)])
+    cmd.extend(["--fourier_mse_weight", str(args.fourier_mse_weight)])
     try:
         cmd.extend(["--load_checkpoint", str(checkpoint_path)])
     except:
@@ -131,7 +143,7 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
 
     # Carve the current volume to produce the model input, matching training
     # carved_vol = apply_missing_wedge(current_vol, angular_range_deg, start_angle_deg, tilt_axis)
-    # carved_norm = normalize_fn(carved_vol)  # (D, H, W), normalized
+    # carved_norm = normalize_fn(carved_vol)  # (D, H, W), normalized 
     
     # no missing wedge is imposed before feeding it to the inference model, so input does not have a missing wedge (except from the firt round)
     carved_norm = normalize_fn(current_vol)  # (D, H, W), normalized 

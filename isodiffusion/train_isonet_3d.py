@@ -36,7 +36,8 @@ for _candidate in (Path("/myhome/BaseTraining"), Path("/myhome/sdsc"), Path("/my
 from pytorch_base.base_loss import BaseLoss
 from pytorch_base.experiment import PyTorchExperiment
 from isodiffusion.datasets import MissingConeVolumes
-from isodiffusion.volume_augmentation import VolumeAugmentor
+from isodiffusion.fourier_wedge import build_missing_wedge_mask
+from isodiffusion.volume_augmentation import VolumeAugmentor, rotate_mask
 
 
 def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, float, float]:
@@ -44,6 +45,7 @@ def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dat
     if args.norm_min is not None and args.norm_max is not None:
         normalize_range = (args.norm_min, args.norm_max)
 
+    target_path = Path(args.target_path) if getattr(args, "target_path", None) else None
     ds_train = MissingConeVolumes(
         data_path=Path(args.data_path),
         cone_width_deg=args.cone_width_deg,
@@ -54,6 +56,7 @@ def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dat
         carve_center_angle_deg=args.carve_center_angle_deg,
         tilt_axis=args.tilt_axis,
         rotate=not args.no_rotate,
+        target_path=target_path,
     )
     norm_min = ds_train.norm_min
     norm_max = ds_train.norm_max
@@ -68,6 +71,7 @@ def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dat
         carve_center_angle_deg=args.carve_center_angle_deg,
         tilt_axis=args.tilt_axis,
         rotate=not args.no_rotate,
+        target_path=target_path,
     )
 
     n = len(ds_train)
@@ -144,12 +148,31 @@ class IsoNetLoss(BaseLoss):
     With predict_residual: MSE(model(normalize(carved_x)), normalize(x) - normalize(carved_x)).
     """
 
-    def __init__(self, device: torch.device, cross_attention_dim: int, augmentor: VolumeAugmentor, loss_type: str = "huber", predict_residual: bool = False) -> None:
-        super().__init__(["loss"])
+    def __init__(
+        self,
+        device: torch.device,
+        cross_attention_dim: int,
+        augmentor: VolumeAugmentor,
+        loss_type: str = "huber",
+        predict_residual: bool = False,
+        fourier_loss_weight: float = 1.0,
+        fourier_mse_weight: float = 0.1,
+        cone_width_deg: float = 0.0,
+        carve_center_angle_deg: float = 0.0,
+        tilt_axis: int = 0,
+    ) -> None:
+        metrics = ["loss", "f_loss_magnitude", "f_loss_mse", "real_space_loss"] if fourier_loss_weight > 0 else ["loss"]
+        super().__init__(metrics)
         self.device = device
         self.cross_attention_dim = int(cross_attention_dim)
         self.augmentor = augmentor
         self.predict_residual = predict_residual
+        self.fourier_loss_weight = fourier_loss_weight
+        self.fourier_mse_weight = fourier_mse_weight
+        self.cone_width_deg = cone_width_deg
+        self.carve_center_angle_deg = carve_center_angle_deg
+        self.tilt_axis = tilt_axis
+        self._mask_cache: dict = {}
         loss_type = loss_type.lower()
         if loss_type == "mae":
             self.loss_fn = nn.L1Loss()
@@ -160,9 +183,75 @@ class IsoNetLoss(BaseLoss):
         else:
             raise ValueError("loss_type must be one of: mae, mse, huber")
 
+    def _wedge_masks(self, vol_shape: tuple, device: torch.device):
+        """Return (keep_mask, missing_mask) for the artificial wedge geometry."""
+        key = (vol_shape, str(device))
+        if key not in self._mask_cache:
+            kept_range = 180.0 - self.cone_width_deg
+            start_angle = (self.carve_center_angle_deg + self.cone_width_deg / 2.0) % 180.0
+            keep = build_missing_wedge_mask(vol_shape, kept_range, start_angle, self.tilt_axis, device=device)
+            self._mask_cache[key] = (keep, ~keep)
+        return self._mask_cache[key]
+
+    def _fourier_loss(self, pred: torch.Tensor, target: torch.Tensor, R) -> torch.Tensor:
+        p = pred.squeeze(1).float()      # (B, D, H, W)
+        t = target.squeeze(1).float()
+
+        vol_shape = tuple(p.shape[1:])
+        orig_keep, artificial_missing = self._wedge_masks(vol_shape, p.device)
+
+        # Restrict loss to artificial missing wedge, but exclude the original
+        # missing wedge (now at a rotated orientation) where the target has no
+        # valid data.  When R is None (no rotation) the wedges are co-aligned so
+        # we skip the Fourier loss to avoid supervising on empty targets.
+        if R is None:
+            return (
+                torch.tensor(0.0, device=p.device),
+                torch.tensor(0.0, device=p.device),
+            )
+        orig_keep_rotated = rotate_mask(orig_keep, R.to(p.device))  # (B, D, H, W)
+        valid_missing = artificial_missing.unsqueeze(0) & orig_keep_rotated  # (B, D, H, W)
+        
+        F_pred = torch.fft.fftshift(torch.fft.fftn(p, dim=(-3, -2, -1)), dim=(-3, -2, -1))
+        F_tgt = torch.fft.fftshift(torch.fft.fftn(t, dim=(-3, -2, -1)), dim=(-3, -2, -1))
+
+        mag_loss = nn.functional.mse_loss(
+            torch.log1p(torch.abs(F_pred * valid_missing)),
+            torch.log1p(torch.abs(F_tgt * valid_missing)),
+        )
+        fourier_mse_loss = torch.tensor(0.0, device=p.device)
+        if self.fourier_mse_weight > 0:
+            masked_f_pred = F_pred * valid_missing
+            masked_f_targ = F_tgt  * valid_missing
+
+            n_valid = valid_missing.sum(dim=(-3,-2,-1), keepdim=True)  # (B, 1, 1, 1)
+            scale = (
+                masked_f_targ.abs().pow(2).sum(dim=(-3,-2,-1), keepdim=True) / n_valid
+            ).sqrt() + 1e-8                                            # (B, 1, 1, 1)
+
+            scale = scale.unsqueeze(-1)                                # (B, 1, 1, 1, 1)
+
+            # now view_as_real gives (B, D, H, W, 2), scale (B, 1, 1, 1, 1) broadcasts correctly
+            fourier_mse_loss = self.fourier_mse_weight * nn.functional.mse_loss(
+                torch.view_as_real(masked_f_pred) / scale,
+                torch.view_as_real(masked_f_targ) / scale,
+            )
+            
+            # fourier_mse_loss = self.fourier_mse_weight * nn.functional.mse_loss(
+            #     torch.view_as_real(F_pred * valid_missing),
+            #     torch.view_as_real(F_tgt * valid_missing),
+            # )
+
+        return mag_loss, fourier_mse_loss
+
     def compute_loss(self, instance, model: UNet3DConditionModel):
-        x_raw = instance.float().to(self.device, non_blocking=True)
-        carved_x, x = self.augmentor(x_raw)
+        if isinstance(instance, (list, tuple)):
+            v0, v1 = instance
+            x_raw = (v0.float().to(self.device, non_blocking=True),
+                     v1.float().to(self.device, non_blocking=True))
+        else:
+            x_raw = instance.float().to(self.device, non_blocking=True)
+        carved_x, x, R = self.augmentor(x_raw)
         x = x.unsqueeze(1)
         carved_x = carved_x.unsqueeze(1)
 
@@ -180,13 +269,29 @@ class IsoNetLoss(BaseLoss):
         )[0]
 
         target = x - carved_x if self.predict_residual else x
-        loss = self.loss_fn(pred, target)
-        return loss, {"loss": loss.detach()}
+        real_space_loss = self.loss_fn(pred, target)
+        metrics = {"real_space_loss":real_space_loss.detach()}
+        
+        if self.fourier_loss_weight > 0:
+            f_loss_magnitude, f_loss_mse = self._fourier_loss(pred, target, R)
+            f_loss = f_loss_magnitude + f_loss_mse
+            loss = self.fourier_loss_weight * f_loss
+            metrics["f_loss_magnitude"] = f_loss_magnitude.detach()
+            metrics["f_loss_mse"] = f_loss_mse.detach()
+        else:
+            loss = real_space_loss
+        metrics["loss"] = loss.detach()
+
+        return loss, metrics
 
 
 def parse_args():
     parser = ArgumentParser(description="Train 3D IsoNet (direct regression) for missing-wedge recovery.")
     parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--target_path", type=str, default=None,
+                        help="Frozen v1 target volume(s); same shape as --data_path. "
+                             "When set, v0 is used as the carved input and v1 as the "
+                             "fixed supervision target.")
     parser.add_argument("--cone_width_deg", type=float, required=True)
     parser.add_argument("--norm_min", type=float, default=None)
     parser.add_argument("--norm_max", type=float, default=None)
@@ -232,6 +337,10 @@ def parse_args():
                         help="Base channel width for DDWUNet (used when --model_type ddwunet).")
     parser.add_argument("--predict_residual", action="store_true",
                         help="Train to predict x - carved_x; at inference add carved_x back to recover x.")
+    parser.add_argument("--fourier_loss_weight", type=float, default=1.0,
+                        help="Weight for the Fourier-space loss in the missing wedge (0 to disable).")
+    parser.add_argument("--fourier_mse_weight", type=float, default=0.02,
+                        help="Weight for the phase MSE term relative to the log-magnitude term (0 to disable).")
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument("--save_checkpoint", type=str, default="", help="Absolute path to save the checkpoint.")
     parser.add_argument("--mixed_precision", choices=["no", "fp16", "bf16", "auto"], default="fp16")
@@ -257,7 +366,9 @@ def main() -> None:
 
     os.makedirs("samples", exist_ok=True)
     with torch.no_grad():
-        carved_sample, x_sample = augmentor(train_ds[0].unsqueeze(0))
+        _s = train_ds[0]
+        _s = tuple(t.unsqueeze(0) for t in _s) if isinstance(_s, tuple) else _s.unsqueeze(0)
+        carved_sample, x_sample, _ = augmentor(_s)
     carved_sample, x_sample = carved_sample[0], x_sample[0]
     mid = x_sample.shape[0] // 2
     TF.to_pil_image(x_sample[mid].clamp(0, 1)).save(f"samples/sample_x_{args.exp_name}.png")
@@ -332,7 +443,18 @@ def main() -> None:
         except Exception as exc:
             print(f"xFormers could not be enabled: {exc}")
 
-    loss_fn = IsoNetLoss(device, cross_attention_dim=model.config.cross_attention_dim, augmentor=augmentor, loss_type=args.loss_type, predict_residual=args.predict_residual)
+    loss_fn = IsoNetLoss(
+        device,
+        cross_attention_dim=model.config.cross_attention_dim,
+        augmentor=augmentor,
+        loss_type=args.loss_type,
+        predict_residual=args.predict_residual,
+        fourier_loss_weight=args.fourier_loss_weight,
+        fourier_mse_weight=args.fourier_mse_weight,
+        cone_width_deg=args.cone_width_deg,
+        carve_center_angle_deg=args.carve_center_angle_deg,
+        tilt_axis=args.tilt_axis,
+    )
 
     exp = PyTorchExperiment(
         args=vars(args),

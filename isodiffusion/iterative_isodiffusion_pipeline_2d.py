@@ -27,6 +27,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Iterative 2D IsoDiffusion Pipeline")
     parser.add_argument("--data_path", type=str, required=True,
                         help="Condition/measured volume (starting point)")
+    parser.add_argument("--target_path", type=str, default=None,
+                        help="Frozen v1 target volume, same shape as --data_path. "
+                             "Passed unchanged to every training round so the "
+                             "supervision target does not drift.")
     parser.add_argument("--ground_truth_path", type=str, default=None,
                         help="Optional ground truth for metrics")
     parser.add_argument("--output_dir", type=str, default=None,
@@ -41,7 +45,7 @@ def parse_args():
     parser.add_argument("--volume_size", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=10,
                         help="Axial slice batch size for 2D diffusion training")
-    parser.add_argument("--volume_batch_size", type=int, default=5,
+    parser.add_argument("--volume_batch_size", type=int, default=1,
                         help="Number of 3D volumes per dataloader step")
     parser.add_argument("--epochs", type=int, default=100,
                         help="Epochs for round 0")
@@ -69,7 +73,7 @@ def parse_args():
     parser.add_argument("--num_inference_steps", type=int, default=10)
     parser.add_argument("--start_step_frac", type=float, default=0.01,
                         help="Fraction of DDIM steps to skip at the start (truncated diffusion)")
-    parser.add_argument("--inference_batch_size", type=int, default=10,
+    parser.add_argument("--inference_batch_size", type=int, default=5,
                         help="Volume replicas run in parallel; >1 enables ensemble averaging")
     parser.add_argument("--clip_sample_range", type=float, default=6.0)
     parser.add_argument("--no_axial_only", dest="axial_only", action="store_false",
@@ -101,6 +105,8 @@ def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetun
         "--tilt_axis", str(args.tilt_axis),
         "--save_checkpoint", str(checkpoint_path),
     ]
+    if args.target_path:
+        cmd.extend(["--target_path", str(args.target_path)])
     if args.no_rotate:
         cmd.append("--no_rotate")
     if args.wandb_training:
@@ -189,7 +195,13 @@ def run_inference_worker(checkpoint_path, condition_vol_path, current_vol_path, 
     )
     recon = result.images  # (B, D, H, W) on CPU, averaged across ensemble
     recon = recon.mean(dim=0)  # (D, H, W)
-    recon = guidance(recon)
+    recon = enforce_known_fourier(
+        estimate_volume=recon,
+        measured_volume=condition_batch_dev[0].to(recon.device, dtype=recon.dtype),
+        angular_range_deg=angular_range_deg,
+        start_angle_deg=start_angle_deg,
+        tilt_axis=tilt_axis,
+    )
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     np.save(output_path, recon.numpy().astype(np.float32))

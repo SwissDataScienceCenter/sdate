@@ -48,6 +48,7 @@ def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dat
     if args.norm_min is not None and args.norm_max is not None:
         normalize_range = (args.norm_min, args.norm_max)
 
+    target_path = Path(args.target_path) if getattr(args, "target_path", None) else None
     ds_train = MissingConeVolumes(
         data_path=Path(args.data_path),
         cone_width_deg=args.cone_width_deg,
@@ -58,6 +59,7 @@ def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dat
         carve_center_angle_deg=args.carve_center_angle_deg,
         tilt_axis=args.tilt_axis,
         rotate=not args.no_rotate,
+        target_path=target_path,
     )
     norm_min = ds_train.norm_min
     norm_max = ds_train.norm_max
@@ -72,6 +74,7 @@ def build_datasets(args) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dat
         carve_center_angle_deg=args.carve_center_angle_deg,
         tilt_axis=args.tilt_axis,
         rotate=not args.no_rotate,
+        target_path=target_path,
     )
 
     n = len(ds_train)
@@ -197,8 +200,13 @@ class ConditionalIsoDiffusionLoss(BaseLoss):
             raise ValueError("loss_type must be one of: mae, mse, huber")
 
     def compute_loss(self, instance, model: UNet3DConditionModel):
-        x_raw = instance.float().to(self.device, non_blocking=True)
-        carved_x, x_0 = self.augmentor(x_raw)
+        if isinstance(instance, (list, tuple)):
+            v0, v1 = instance
+            x_raw = (v0.float().to(self.device, non_blocking=True),
+                     v1.float().to(self.device, non_blocking=True))
+        else:
+            x_raw = instance.float().to(self.device, non_blocking=True)
+        carved_x, x_0, _ = self.augmentor(x_raw)
         x_0 = x_0.unsqueeze(1)
         carved_x = carved_x.unsqueeze(1)
 
@@ -234,6 +242,10 @@ class ConditionalIsoDiffusionLoss(BaseLoss):
 def parse_args():
     parser = ArgumentParser(description="Train 3D conditional iso-diffusion model.")
     parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--target_path", type=str, default=None,
+                        help="Frozen v1 target volume(s); same shape as --data_path. "
+                             "When set, v0 is used as the carved input and v1 as the "
+                             "fixed supervision target.")
     parser.add_argument("--cone_width_deg", type=float, required=True)
     parser.add_argument("--norm_min", type=float, default=None)
     parser.add_argument("--norm_max", type=float, default=None)
@@ -335,7 +347,9 @@ def main() -> None:
 
     os.makedirs("samples", exist_ok=True)
     with torch.no_grad():
-        carved_sample, x_sample = augmentor(train_ds[0].unsqueeze(0))
+        _s = train_ds[0]
+        _s = tuple(t.unsqueeze(0) for t in _s) if isinstance(_s, tuple) else _s.unsqueeze(0)
+        carved_sample, x_sample, _ = augmentor(_s)
     carved_sample, x_sample = carved_sample[0], x_sample[0]
     mid = x_sample.shape[0] // 2
     TF.to_pil_image(x_sample[mid].clamp(0, 1)).save(f"samples/sample_x_{args.exp_name}.png")

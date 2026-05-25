@@ -25,6 +25,10 @@ def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description="Iterative 3D IsoNet Pipeline (Time-Resolved)")
     parser.add_argument("--data_path", type=str, required=True, help="Starting volume (measured/conditioned)")
+    parser.add_argument("--target_path", type=str, default=None,
+                        help="Frozen v1 target volume, same shape as --data_path. "
+                             "Passed unchanged to every training round so the "
+                             "supervision target does not drift.")
     parser.add_argument("--ground_truth_path", type=str, default=None, help="Optional ground truth for metrics")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory for reconstructions and checkpoints")
 
@@ -42,6 +46,17 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--exp_name", type=str, default="isonet_tr_iterative")
     parser.add_argument("--no_rotate", action="store_true")
+    parser.add_argument("--predict_residual", action="store_true",
+                        help="Train to predict x - carved_x; add carved_x back at inference.")
+    parser.add_argument("--fourier_loss_weight", type=float, default=1.0,
+                        help="Weight for the Fourier-space log-magnitude loss in the missing wedge (0 to disable).")
+    parser.add_argument("--fourier_mse_weight", type=float, default=0.02,
+                        help="Weight for the normalized phase MSE term relative to the log-magnitude term (0 to disable).")
+    parser.add_argument("--scheduler_type", choices=["cosine_warmup", "cosine_restarts"],
+                        default="cosine_warmup")
+    parser.add_argument("--T_0", type=int, default=None,
+                        help="Epochs per restart for cosine_restarts (default: epochs for that round).")
+    parser.add_argument("--T_mult", type=int, default=1)
     parser.add_argument("--model_type", choices=["unet3d", "dynunet"], default="unet3d",
                         help="Network architecture forwarded to train_isonet_time_resolved.py.")
     parser.add_argument("--dynunet_filters", type=str, default="32,64,128,256,320",
@@ -69,13 +84,25 @@ def run_training_subprocess(data_path, checkpoint_path, epochs, args, is_finetun
         "--exp_name", args.exp_name,
         "--save_checkpoint", str(checkpoint_path),
     ]
+    if args.target_path:
+        cmd.extend(["--target_path", str(args.target_path)])
     if args.no_rotate:
         cmd.append("--no_rotate")
+    if args.predict_residual:
+        cmd.append("--predict_residual")
+    cmd.extend(["--scheduler_type", args.scheduler_type])
+    if args.T_0 is not None:
+        cmd.extend(["--T_0", str(args.T_0)])
+    cmd.extend(["--T_mult", str(args.T_mult)])
     cmd.extend(["--model_type", args.model_type])
     if args.model_type == "dynunet":
         cmd.extend(["--dynunet_filters", args.dynunet_filters])
-    if is_finetuning and Path(checkpoint_path).exists():
+    cmd.extend(["--fourier_loss_weight", str(args.fourier_loss_weight)])
+    cmd.extend(["--fourier_mse_weight", str(args.fourier_mse_weight)])
+    try:
         cmd.extend(["--load_checkpoint", str(checkpoint_path)])
+    except Exception:
+        print("model not found, starting from random initialization.")
 
     print(f"Running training: {' '.join(cmd)}")
     result = subprocess.run(cmd)
@@ -97,6 +124,7 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
     model, _ = load_isonet3d(checkpoint_path, device=device)
     normalize_fn, denormalize_fn, norm_config = load_norm_fns_from_checkpoint_sidecar(checkpoint_path)
 
+    predict_residual = bool(norm_config.get("predict_residual", False))
     cone_width_deg = float(norm_config.get("cone_width_deg", 72.0))
     angular_range_deg = 180.0 - cone_width_deg
     start_angle_deg = float(norm_config.get("start_angle_deg", 0.0))
@@ -150,6 +178,8 @@ def run_inference_worker(checkpoint_path, current_vol_path, output_path, args):
                 counts[d0:d0 + patch_d, h0:h0 + patch_h, w0:w0 + patch_w] += 1.0
 
     recon = output / counts.clamp_min(1.0)
+    if predict_residual:
+        recon = recon + torch.as_tensor(np.asarray(carved_norm), dtype=torch.float32)
     recon = denormalize_fn(recon)
 
     # Enforce per-slice Fourier consistency, matching the per-slice 2-D FFT carving used during training

@@ -41,6 +41,7 @@ class TimeResolvedVolumes(BaseVolumeDataset):
         start_angle_deg: float = 0.0,
         tilt_axis: int = 0,
         rotate: bool = True,
+        target_path: Optional[Union[str, Path]] = None,
     ) -> None:
         self.start_angle_deg = float(start_angle_deg)
         super().__init__(
@@ -52,6 +53,7 @@ class TimeResolvedVolumes(BaseVolumeDataset):
             samples_per_volume=samples_per_volume,
             tilt_axis=tilt_axis,
             rotate=rotate,
+            target_path=target_path,
         )
 
     def _carve_wedge(self, volume: torch.Tensor) -> torch.Tensor:
@@ -85,5 +87,6 @@ class TimeResolvedVolumes(BaseVolumeDataset):
             f"start_angle_deg={self.start_angle_deg:.1f}, "
             f"angular_range_deg={angular_range:.1f}, "
             f"tilt_axis={self.tilt_axis}, "
-            f"norm=[{self.norm_min:.4g}, {self.norm_max:.4g}], rotate={self.rotate})"
+            f"norm=[{self.norm_min:.4g}, {self.norm_max:.4g}], rotate={self.rotate}, "
+            f"frozen_target={self._target_files is not None})"
         )

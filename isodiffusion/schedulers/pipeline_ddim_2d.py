@@ -209,22 +209,25 @@ class DDIMPipeline2D(DiffusionPipeline):
         patch_shape: Tuple[int, int, int],
         starts: Tuple[List[int], List[int], List[int]],
     ) -> torch.Tensor:
+        # NOTE: for large volumes this materialises all patches at once and is very
+        # memory-intensive. Prefer the streaming patch loop in truncated_pipeline.
         d_starts, h_starts, w_starts = starts
         patch_d, patch_h, patch_w = patch_shape
-        patches = [
-            model_input[
-                batch_idx,
-                :,
-                d0 : d0 + patch_d,
-                h0 : h0 + patch_h,
-                w0 : w0 + patch_w,
+        with torch.no_grad():
+            patches = [
+                model_input[
+                    batch_idx,
+                    :,
+                    d0 : d0 + patch_d,
+                    h0 : h0 + patch_h,
+                    w0 : w0 + patch_w,
+                ]
+                for batch_idx in range(model_input.shape[0])
+                for d0 in d_starts
+                for h0 in h_starts
+                for w0 in w_starts
             ]
-            for batch_idx in range(model_input.shape[0])
-            for d0 in d_starts
-            for h0 in h_starts
-            for w0 in w_starts
-        ]
-        return torch.stack(patches, dim=0)
+            return torch.stack(patches, dim=0)
 
     def _aggregate_noise_patches(
         self,
@@ -238,30 +241,31 @@ class DDIMPipeline2D(DiffusionPipeline):
         patch_d, patch_h, patch_w = patch_shape
         d, h, w = volume_shape
 
-        accum = torch.zeros(batch_size, d, h, w, device=noise_pred_patches.device, dtype=noise_pred_patches.dtype)
-        count = torch.zeros_like(accum)
+        with torch.no_grad():
+            accum = torch.zeros(batch_size, d, h, w, device=noise_pred_patches.device, dtype=noise_pred_patches.dtype)
+            count = torch.zeros_like(accum)
 
-        patch_idx = 0
-        for batch_idx in range(batch_size):
-            for d0 in d_starts:
-                for h0 in h_starts:
-                    for w0 in w_starts:
-                        patch = noise_pred_patches[patch_idx, 0]
-                        accum[
-                            batch_idx,
-                            d0 : d0 + patch_d,
-                            h0 : h0 + patch_h,
-                            w0 : w0 + patch_w,
-                        ] += patch
-                        count[
-                            batch_idx,
-                            d0 : d0 + patch_d,
-                            h0 : h0 + patch_h,
-                            w0 : w0 + patch_w,
-                        ] += 1.0
-                        patch_idx += 1
+            patch_idx = 0
+            for batch_idx in range(batch_size):
+                for d0 in d_starts:
+                    for h0 in h_starts:
+                        for w0 in w_starts:
+                            patch = noise_pred_patches[patch_idx, 0]
+                            accum[
+                                batch_idx,
+                                d0 : d0 + patch_d,
+                                h0 : h0 + patch_h,
+                                w0 : w0 + patch_w,
+                            ] += patch
+                            count[
+                                batch_idx,
+                                d0 : d0 + patch_d,
+                                h0 : h0 + patch_h,
+                                w0 : w0 + patch_w,
+                            ] += 1.0
+                            patch_idx += 1
 
-        return accum / count.clamp_min(1.0)
+            return accum / count.clamp_min(1.0)
 
     @staticmethod
     def _patches_to_axis_slices(patches: torch.Tensor, axis: str) -> torch.Tensor:
@@ -366,79 +370,99 @@ class DDIMPipeline2D(DiffusionPipeline):
             _patch_starts(h, patch_h, stride[1]),
             _patch_starts(w, patch_w, stride[2]),
         )
-        n_patches_per_volume = len(starts[0]) * len(starts[1]) * len(starts[2])
-        n_patches = batch_size * n_patches_per_volume
-
         selected_timesteps = timesteps[start_step:]
-        for local_step_idx, t in enumerate(self.progress_bar(selected_timesteps)):
-            axis = self._axis_for_step(local_step_idx, len(selected_timesteps))
-            model_input = torch.stack([image, conditioning], dim=1)
-            model_input_patches = self._extract_model_input_patches(model_input, patch_shape, starts)
+        zeros_patch = None  # reused buffer for non-axial conditioning
 
-            if axis != "axial":
-                model_input_patches[:, 1] = 0.0
+        step_kwargs = {}
+        if use_clipped_model_output is not None:
+            step_kwargs["use_clipped_model_output"] = use_clipped_model_output
 
-            model_input_slices = self._patches_to_axis_slices(model_input_patches, axis)
-            n_slices = model_input_slices.shape[0]
-            class_label = 1 if axis == "axial" else 0
-            noise_pred_slices = torch.empty(
-                n_slices,
-                1,
-                model_input_slices.shape[-2],
-                model_input_slices.shape[-1],
-                device=device,
-                dtype=model_input_slices.dtype,
-            )
+        with torch.no_grad():
+            for local_step_idx, t in enumerate(self.progress_bar(selected_timesteps)):
+                axis = self._axis_for_step(local_step_idx, len(selected_timesteps))
+                class_label = 1 if axis == "axial" else 0
+                axial = axis == "axial"
 
-            with torch.no_grad():
-                for batch_start in range(0, n_slices, self.slice_batch_size):
-                    batch_end = min(batch_start + self.slice_batch_size, n_slices)
-                    chunk_input = model_input_slices[batch_start:batch_end]
-                    class_labels = torch.full(
-                        (chunk_input.shape[0],),
-                        class_label,
-                        device=device,
-                        dtype=torch.long,
-                    )
-                    pred_chunk = self.unet(
-                        chunk_input,
-                        t,
-                        class_labels=class_labels,
-                        return_dict=False,
-                    )[0]
-                    noise_pred_slices[batch_start:batch_end] = pred_chunk
+                accum = torch.zeros(batch_size, d, h, w, device=device, dtype=dtype)
+                count = torch.zeros_like(accum)
 
-            noise_pred_patches = self._axis_slices_to_patches(
-                noise_pred_slices,
-                axis=axis,
-                n_patches=n_patches,
-                patch_shape=patch_shape,
-            )
-            model_output = self._aggregate_noise_patches(
-                noise_pred_patches=noise_pred_patches,
-                batch_size=batch_size,
-                volume_shape=(d, h, w),
-                patch_shape=patch_shape,
-                starts=starts,
-            )
+                for batch_idx in range(batch_size):
+                    for d0 in starts[0]:
+                        for h0 in starts[1]:
+                            for w0 in starts[2]:
+                                img_patch = image[
+                                    batch_idx,
+                                    d0 : d0 + patch_d,
+                                    h0 : h0 + patch_h,
+                                    w0 : w0 + patch_w,
+                                ].unsqueeze(0)  # (1, pd, ph, pw)
 
-            step_kwargs = {}
-            if use_clipped_model_output is not None:
-                step_kwargs["use_clipped_model_output"] = use_clipped_model_output
+                                if axial:
+                                    cond_patch = conditioning[
+                                        batch_idx,
+                                        d0 : d0 + patch_d,
+                                        h0 : h0 + patch_h,
+                                        w0 : w0 + patch_w,
+                                    ].unsqueeze(0)
+                                else:
+                                    if zeros_patch is None or zeros_patch.shape != img_patch.shape:
+                                        zeros_patch = torch.zeros_like(img_patch)
+                                    cond_patch = zeros_patch
 
-            image = self.scheduler.step(
-                model_output,
-                int(t.item()),
-                image,
-                eta=eta,
-                generator=generator,
-                normalize_fn=self.normalize_fn,
-                denormalize_fn=self.denormalize_fn,
-                **step_kwargs,
-            ).prev_sample
+                                # (1, 2, pd, ph, pw) — only one patch in memory
+                                patch = torch.stack([img_patch, cond_patch], dim=1)
 
-            if XLA_AVAILABLE:
-                xm.mark_step()
+                                slices = self._patches_to_axis_slices(patch, axis)
+                                n_slices = slices.shape[0]
+                                noise_pred_slices = torch.empty(
+                                    n_slices, 1, slices.shape[-2], slices.shape[-1],
+                                    device=device, dtype=dtype,
+                                )
+
+                                for s0 in range(0, n_slices, self.slice_batch_size):
+                                    s1 = min(s0 + self.slice_batch_size, n_slices)
+                                    chunk = slices[s0:s1]
+                                    class_labels = torch.full(
+                                        (chunk.shape[0],), class_label, device=device, dtype=torch.long
+                                    )
+                                    noise_pred_slices[s0:s1] = self.unet(
+                                        chunk, t, class_labels=class_labels, return_dict=False
+                                    )[0]
+
+                                pred_patch = self._axis_slices_to_patches(
+                                    noise_pred_slices, axis=axis, n_patches=1, patch_shape=patch_shape
+                                )  # (1, 1, pd, ph, pw)
+
+                                accum[
+                                    batch_idx,
+                                    d0 : d0 + patch_d,
+                                    h0 : h0 + patch_h,
+                                    w0 : w0 + patch_w,
+                                ] += pred_patch[0, 0]
+                                count[
+                                    batch_idx,
+                                    d0 : d0 + patch_d,
+                                    h0 : h0 + patch_h,
+                                    w0 : w0 + patch_w,
+                                ] += 1.0
+
+                model_output = accum / count.clamp_min(1.0)
+                del accum, count
+
+                image = self.scheduler.step(
+                    model_output,
+                    int(t.item()),
+                    image,
+                    eta=eta,
+                    generator=generator,
+                    normalize_fn=self.normalize_fn,
+                    denormalize_fn=self.denormalize_fn,
+                    **step_kwargs,
+                ).prev_sample
+                del model_output
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
 
         image = self.denormalize_fn(image).float().cpu()
         if squeeze_output:
