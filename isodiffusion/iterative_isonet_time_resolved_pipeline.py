@@ -50,7 +50,7 @@ def parse_args():
                         help="Train to predict x - carved_x; add carved_x back at inference.")
     parser.add_argument("--fourier_loss_weight", type=float, default=1.0,
                         help="Weight for the Fourier-space log-magnitude loss in the missing wedge (0 to disable).")
-    parser.add_argument("--fourier_mse_weight", type=float, default=0.02,
+    parser.add_argument("--fourier_mse_weight", type=float, default=1.0,
                         help="Weight for the normalized phase MSE term relative to the log-magnitude term (0 to disable).")
     parser.add_argument("--scheduler_type", choices=["cosine_warmup", "cosine_restarts"],
                         default="cosine_warmup")
