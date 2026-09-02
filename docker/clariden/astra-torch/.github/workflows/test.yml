@@ -1,0 +1,71 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: lfbarba/sdsc_image:1.0.0
+      options: --gpus all
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Verify Python environment
+      run: |
+        python --version
+        which python
+        python -c "import sys; print('Python path:', sys.executable)"
+    
+    - name: Install package in development mode
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+    
+    - name: Install test dependencies
+      run: |
+        pip install pytest pytest-cov || echo "Installing pytest manually..."
+        pip install pytest==7.4.0 pytest-cov==4.1.0
+    
+    - name: Verify imports
+      run: |
+        python -c "import astra_torch; print('ASTRA-Torch imported successfully')"
+        python -c "import torch; print('PyTorch version:', torch.__version__)"
+        python -c "import numpy as np; print('NumPy version:', np.__version__)"
+    
+    - name: Run basic tests
+      run: |
+        python -m pytest tests/ -v --tb=short --no-cov
+      continue-on-error: false
+
+  test-gpu:
+    runs-on: ubuntu-latest
+    container:
+      image: lfbarba/sdsc_image:1.0.0
+      options: --gpus all
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install package
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install pytest==7.4.0 pytest-cov==4.1.0
+    
+    - name: Test GPU functionality
+      run: |
+        python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+        python -c "import torch; print('GPU count:', torch.cuda.device_count())" || echo "No GPU available"
+    
+    - name: Run GPU tests if available
+      run: |
+        pytest tests/ -v --tb=short -k "gpu" || echo "No GPU-specific tests found"
+      continue-on-error: true

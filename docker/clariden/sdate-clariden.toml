@@ -1,0 +1,18 @@
+# Environment Definition File (EDF) for CSCS Container Engine.
+# Usage:  srun --environment=./docker/clariden/sdate-clariden.toml <command>
+# Docs:   https://docs.cscs.ch/software/ml/pytorch/
+
+image = "${SCRATCH}/ce-images/sdate-clariden+0.1.sqsh"
+
+mounts = [
+    "/capstor",
+    "/iopsstor",
+]
+
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"
+
+[env]
+NCCL_DEBUG = "INFO"
+CUDA_CACHE_DISABLE = "1"

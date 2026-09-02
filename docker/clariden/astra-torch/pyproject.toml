@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astra-torch"
+version = "0.1.0"
+description = "GPU-accelerated tomographic reconstruction library with PyTorch integration"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "CHIP Project", email = "chip@example.com"},
+]
+keywords = ["tomography", "reconstruction", "pytorch", "astra", "cbct", "laminography"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=1.9.0",
+    "numpy>=1.21.0", 
+    "tqdm>=4.60.0",
+    "astra-toolbox>=2.0.0",
+    "h5py>=3.0.0",
+    "scipy>=1.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "black>=21.0",
+    "flake8>=3.9",
+    "mypy>=0.910",
+    "pytest-cov>=2.12.0",
+]
+notebooks = [
+    "jupyter>=1.0.0",
+    "matplotlib>=3.3.0",
+    "ipywidgets>=7.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/chip-project/astra-torch"
+Documentation = "https://astra-torch.readthedocs.io/"
+Repository = "https://github.com/chip-project/astra-torch.git"
+"Bug Tracker" = "https://github.com/chip-project/astra-torch/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["astra_torch*"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''

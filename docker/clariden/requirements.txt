@@ -1,0 +1,38 @@
+# Python packages layered on top of the CSCS Alps-extended NGC PyTorch image.
+# torch/torchvision are NOT listed here on purpose: the base image ships
+# builds already tuned for Alps' Slingshot fabric (NCCL/libfabric hooks) and
+# for GH200 (arm64 + CUDA 12.x, sm_90) -- reinstalling them would fight that.
+#
+# Confirmed on PyPI: linux_aarch64 wheels for hdf5plugin, pyarrow,
+# opencv-python, SimpleITK, pillow_heif, cupy-cuda12x. kornia/monai/tifffile/
+# lovely-tensors/torch_dct/huffman ship pure-Python wheels (arch-independent).
+# mumott has no wheel at all (any arch) but installs from sdist fine --
+# it's numba-jitted Python, no compiled extension of its own.
+
+diffusers
+transformers
+accelerate
+Pillow
+lovely-tensors
+tqdm
+wandb
+ipywidgets
+opencv-python
+matplotlib
+pandas
+h5py
+hdf5plugin
+einops
+pyarrow
+scikit-image
+nibabel
+kornia
+joblib
+SimpleITK
+monai
+tifffile
+pillow_heif
+torch_dct
+huffman
+cupy-cuda12x
+mumott

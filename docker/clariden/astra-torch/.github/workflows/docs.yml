@@ -1,0 +1,41 @@
+name: Documentation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    container:
+      image: lfbarba/sdsc_image:1.0.0
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install package and documentation dependencies
+      run: |
+        pip install -e ".[dev]"
+        pip install sphinx sphinx-rtd-theme myst-parser || echo "Installing docs dependencies manually..."
+        pip install sphinx==4.5.0 sphinx-rtd-theme==1.2.0 myst-parser==0.18.0
+    
+    - name: Build documentation
+      run: |
+        cd docs
+        make html
+    
+    - name: Upload documentation artifacts
+      uses: actions/upload-artifact@v3
+      if: github.event_name == 'pull_request'
+      with:
+        name: docs-html
+        path: docs/_build/html/
+    
+    - name: Deploy to GitHub Pages
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: docs/_build/html
