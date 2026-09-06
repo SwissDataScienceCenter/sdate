@@ -58,6 +58,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, "/myhome/sdate")
 sys.path.insert(0, "/myhome/astra-torch")
@@ -206,6 +207,20 @@ def parse_args():
                         "*_fov.npy / phi_sweep_fov.npz) is the physically-supported region -- the "
                         "periphery is a stabilization aid, not a trustworthy reconstruction in its "
                         "own right.")
+    p.add_argument("--destripe_kernel", type=int, default=0,
+                   help="If >0, correct a per-detector-column ring-artifact bias before fitting: "
+                        "estimate it from the held-in views' view-averaged attenuation using the "
+                        "same method as sdate.tr_diffusion.reconstruct.destripe_sinogram (the "
+                        "FBP-side de-ringing already used elsewhere in this project) with this "
+                        "kernel width, then fold it into a corrected I0 (I0 *= exp(-bias)) rather "
+                        "than editing the sinogram/attenuation the likelihood sees. The FBP version "
+                        "subtracts the bias from a reconstructed attenuation image and reconstructs "
+                        "that; doing the equivalent here -- editing the values the Poisson NLL is "
+                        "evaluated against -- would repeat this project's fabricated-data-under-a-"
+                        "real-likelihood mistake (see --pad_factor's note above). Correcting I0 "
+                        "instead treats the bias as what it physically is, a residual flat-field "
+                        "calibration error, so the real counts and their genuine Poisson variance "
+                        "are never touched. 0 disables (the long-standing behavior).")
     p.add_argument("--tag", default=None)
     return p.parse_args()
 
@@ -286,6 +301,33 @@ def make_chunks(idx, theta_deg, phi, counts_row, max_views, device, vol_shape, d
     TRAINING side no longer uses this."""
     return [build_chunk(idx[start:start + max_views], theta_deg, phi, counts_row, device, vol_shape, det_shape)
             for start in range(0, len(idx), max_views)]
+
+
+def estimate_ring_bias(counts_row: np.ndarray, I0: torch.Tensor, dark: torch.Tensor,
+                        idx: np.ndarray, device, kernel: int = 31) -> torch.Tensor:
+    """Per-detector-column ring-artifact bias, estimated the same way as
+    sdate.tr_diffusion.reconstruct.destripe_sinogram: a genuine per-column
+    calibration mismatch (residual flat/dark error, or a flat/dark-vs-sample
+    count-rate mismatch) is angle-invariant, so it survives averaging the
+    real attenuation over held-in views as a high-spatial-frequency
+    (column-to-column) component -- real object content is smooth in the
+    view average since phi/theta sweep the object through many angles within
+    the held-in pool. Returns an additive log-attenuation bias per column,
+    (n_cols,); the caller folds it into I0 (I0 *= exp(-bias)) rather than
+    subtracting it from the sinogram/attenuation the likelihood is evaluated
+    against -- the FBP version edits the reconstructed attenuation directly,
+    but doing that here would assert Poisson shot-noise confidence around
+    edited values instead of the real counts, exactly the fabricated-data
+    mistake fixed for --pad_factor above. Correcting I0 instead treats the
+    bias as what it physically is: a residual flat-field calibration error."""
+    sub = torch.from_numpy(np.ascontiguousarray(counts_row[idx])).to(device=device, dtype=torch.float32)
+    ratio = ((sub - dark.unsqueeze(0)) / I0.unsqueeze(0)).clamp_min(1e-6)
+    atten = -torch.log(ratio)
+    col_mean = atten.mean(dim=0)  # (n_cols,)
+    pad = kernel // 2
+    padded = F.pad(col_mean.view(1, 1, -1), (pad, pad), mode="reflect")
+    smoothed = F.avg_pool1d(padded, kernel, stride=1).view(-1)
+    return col_mean - smoothed
 
 
 def compute_sensitivity(theta_deg, idx, vol_shape, det_shape, device, max_views):
@@ -412,6 +454,14 @@ def main():
     dark = to_t(dark_row)
     sigma_read2 = to_t(dark_var_row)
 
+    if a.destripe_kernel > 0:
+        ring_bias = estimate_ring_bias(counts_row, I0, dark, held_in_idx, device,
+                                        kernel=a.destripe_kernel)
+        I0 = I0 * torch.exp(-ring_bias)
+        log(f"de-ringing: corrected I0 per-column from held-in view-averaged attenuation "
+            f"(kernel={a.destripe_kernel}), bias range [{ring_bias.min().item():.4f}, "
+            f"{ring_bias.max().item():.4f}]")
+
     assert a.batch_size <= a.max_views_per_call, "--batch_size must not exceed --max_views_per_call"
     vol_shape = (1, n_cols_recon, n_cols_recon)
     det_shape = (1, n_cols)  # real detector width ALWAYS -- never widened/padded
@@ -493,6 +543,7 @@ def main():
     results["pos_weight"] = a.pos_weight
     results["precondition"] = a.precondition
     results["l_clamp"] = a.l_clamp
+    results["destripe_kernel"] = a.destripe_kernel
     with open(out_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
 
