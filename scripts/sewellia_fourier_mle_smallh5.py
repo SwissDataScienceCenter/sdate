@@ -220,10 +220,17 @@ def fit(coeffs, held_in_idx, rng, theta_deg, phi, atten_row, device, vol_shape, 
         optimizer.zero_grad(set_to_none=True)
         loss = chunk_mse(batch, coeffs, k, n_cols)
         if tv_weight > 0:
-            dz = (coeffs[1:, :, :] - coeffs[:-1, :, :]).abs().sum()
-            dy = (coeffs[:, 1:, :] - coeffs[:, :-1, :]).abs().sum()
-            dx = (coeffs[:, :, 1:] - coeffs[:, :, :-1]).abs().sum()
-            loss = loss + tv_weight * (dz + dy + dx)
+            # Spatial TV only, per basis channel independently -- summing a
+            # (1, H, W) slice's dy+dx so the basis-channel axis (a0/aj/bj)
+            # is never differenced against itself (that axis has no spatial
+            # meaning). Matches sewellia_fourier_mle_slice.py's _tv_loss
+            # convention, looped the same way.
+            tv = sum(
+                (coeffs[i:i + 1, 1:, :] - coeffs[i:i + 1, :-1, :]).abs().sum()
+                + (coeffs[i:i + 1, :, 1:] - coeffs[i:i + 1, :, :-1]).abs().sum()
+                for i in range(n_basis)
+            )
+            loss = loss + tv_weight * tv
         if pos_weight > 0 and phi_probe is not None:
             loss = loss + pos_weight * positivity_penalty(coeffs, k, phi_probe)
         loss.backward()
