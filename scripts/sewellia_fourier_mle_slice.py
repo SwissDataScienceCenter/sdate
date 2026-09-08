@@ -103,7 +103,18 @@ def parse_args():
     p.add_argument("--fit_k0_baseline", action="store_true", default=True)
     p.add_argument("--no_k0_baseline", dest="fit_k0_baseline", action="store_false")
     p.add_argument("--steps", type=int, default=3000)
-    p.add_argument("--lr", type=float, default=0.05)
+    p.add_argument("--lr", type=float, default=0.001,
+                   help="0.001 matches the value run_sewellia_fourier_clariden.sh has always "
+                        "overridden this to. The old bare default of 0.05 looked harmless but "
+                        "isn't: from the all-zero init, Adam's first step moves every voxel by "
+                        "~lr regardless of the true gradient scale, and l_pred sums that change "
+                        "over the ray's full path through the (padded) volume -- at lr=0.05 "
+                        "over a several-hundred-voxel ray this overshoots nll_from_l's l_clamp "
+                        "(default 5.0) by 4-20x on step 1, permanently zeroing the gradient "
+                        "through the clamp forever after (confirmed 2026-09-07: holdout_nll "
+                        "frozen bit-for-bit from step 0 onward for every z tried). No error or "
+                        "warning is raised -- the run completes and looks like a normal "
+                        "untrained/zero-init reconstruction, not a crash.")
     p.add_argument("--holdout_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tv_weight", type=float, default=0.0)
