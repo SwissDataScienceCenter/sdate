@@ -18,6 +18,7 @@ reuse ``TrFbpCodecDataset`` for a real inference/decode benchmark yet.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -29,9 +30,16 @@ from .config import CodecConfig, DataConfig, QuantConfig
 from .quantization import quantize_to_12bit
 
 # See DEPENDENCIES.md "Reused data artifact" -- built for a different
-# (T5-native Gaussian-floor denoiser) project, reused here as-is.
-_TAP_CACHE_DIR = Path("/myhome/data/sdate/shared/time_resolved/jointfbp_context")
-_TAP_CACHE_PREFIX = "212_Wunderkerze2_jointfbpctx_T5_native_tap0"
+# (T5-native Gaussian-floor denoiser) project, reused here as-is. Path is
+# RunAI-sandbox-specific (/myhome/...); override via TR_FBP_CODEC_TAP_CACHE_DIR
+# on environments with a different filesystem layout (e.g. CSCS Clariden,
+# where /myhome doesn't exist at all) -- see DEPENDENCIES.md "Portability".
+_TAP_CACHE_DIR = Path(os.environ.get(
+    "TR_FBP_CODEC_TAP_CACHE_DIR", "/myhome/data/sdate/shared/time_resolved/jointfbp_context"
+))
+_TAP_CACHE_PREFIX = os.environ.get(
+    "TR_FBP_CODEC_TAP_CACHE_PREFIX", "212_Wunderkerze2_jointfbpctx_T5_native_tap0"
+)
 
 
 def _load_tap0_cache() -> Tuple[np.memmap, int, int]:
@@ -79,7 +87,13 @@ class TrFbpCodecDataset(Dataset):
 
         profile = REGISTRY[data_cfg.profile_name]
         self.profile = profile
-        self.src = MemmapFrameSource(profile.memmap_path, profile.mov_path)
+        # Override for environments with a different filesystem layout than
+        # the RunAI sandbox's /myhome/... (e.g. Clariden) -- see
+        # DEPENDENCIES.md "Portability". mov_path need not physically exist
+        # (only used to locate the .norm.npz sidecar next to it).
+        memmap_path = os.environ.get("TR_FBP_CODEC_MEMMAP_PATH", profile.memmap_path)
+        mov_path = os.environ.get("TR_FBP_CODEC_MOV_PATH", profile.mov_path)
+        self.src = MemmapFrameSource(memmap_path, mov_path)
 
         if codec_cfg.use_fbp_prior:
             self.tap_mm, self.tap_first, self.tap_n = _load_tap0_cache()

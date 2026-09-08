@@ -109,12 +109,22 @@ class FfmpegFrameSource(FrameSource):
         fps: float = 30.0,
         window: int = 8,
         cache_size: int = 4096,
+        height: int = FRAME_H,
+        width: int = FRAME_W,
     ):
         self.mov_path = str(mov_path)
         self.ffmpeg = ffmpeg if Path(ffmpeg).exists() else "ffmpeg"
         self.fps = float(fps)
         self.window = int(window)
         self.cache_size = int(cache_size)
+        # `height`/`width` default to the wunderkerze2 class-level constants for
+        # backward compatibility, but MUST be overridden for any other dataset
+        # -- the base FrameSource class attributes are just wunderkerze2-shaped
+        # defaults, not a real "native size", and silently decoding the wrong
+        # byte count per frame (e.g. asc_thixo's 128x480 read as 128x528) makes
+        # every decoded frame come back empty, not merely wrong-shaped.
+        self.height = int(height)
+        self.width = int(width)
         side = load_norm_sidecar(mov_path)
         self.per_frame_min = side["per_frame_min"]
         self.per_frame_max = side["per_frame_max"]

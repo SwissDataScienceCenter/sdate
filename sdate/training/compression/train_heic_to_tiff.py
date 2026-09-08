@@ -139,11 +139,15 @@ class HeicToTiffTrainer:
         volume_size: int = 64,
         stride: int = 32,
         num_frames: int = 100,
+        start_offset: int = 0,
         batch_size: int = 4,
         learning_rate: float = 1e-4,
         num_epochs: int = 100,
         validation_split: float = 0.2,
         heic_quality: int = 85,
+        residual_path: Optional[str] = None,
+        resume_from_checkpoint: Optional[str] = None,
+        reset_optimizer: bool = False,
         max_workers: int = 8,
         mixed_precision: str = "fp16",
         gradient_accumulation_steps: int = 1,
@@ -165,11 +169,20 @@ class HeicToTiffTrainer:
             volume_size: Size of sub-volumes for training
             stride: Stride for sub-volume extraction
             num_frames: Number of TIFF frames to load
+            start_offset: Starting frame offset for dataset
             batch_size: Training batch size
             learning_rate: Learning rate for optimizer
             num_epochs: Number of training epochs
             validation_split: Fraction of data to use for validation
             heic_quality: HEIC compression quality
+            residual_path: Optional path to pre-computed residuals. If provided, residuals will be loaded
+                          as a third channel, and the model will receive 3-channel input (HEIC + residual + zero).
+                          If None, zero padding is used for the second input channel.
+            resume_from_checkpoint: Optional path to checkpoint directory to resume training from.
+                                   Should point to a checkpoint saved by this script (e.g., "outputs/checkpoint-1000").
+            reset_optimizer: If True, reset optimizer and scheduler to new parameters when resuming from checkpoint.
+                           Model weights are still loaded, but optimizer state is reinitialized. Useful for
+                           fine-tuning with different learning rates. Default: False.
             max_workers: Number of workers for data loading
             mixed_precision: Mixed precision training ("fp16", "bf16", or None)
             gradient_accumulation_steps: Steps to accumulate gradients
@@ -187,11 +200,15 @@ class HeicToTiffTrainer:
         self.volume_size = volume_size
         self.stride = stride
         self.num_frames = num_frames
+        self.start_offset = start_offset
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.num_epochs = num_epochs
         self.validation_split = validation_split
         self.heic_quality = heic_quality
+        self.residual_path = Path(residual_path) if residual_path else None
+        self.resume_from_checkpoint = Path(resume_from_checkpoint) if resume_from_checkpoint else None
+        self.reset_optimizer = reset_optimizer
         self.max_workers = max_workers
         self.mixed_precision = mixed_precision
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -236,23 +253,32 @@ class HeicToTiffTrainer:
         self.val_dataset = None
         self.train_dataloader = None
         self.val_dataloader = None
+        self.global_step = 0
+        self.start_epoch = 0
         
     def setup_dataset(self):
         """Setup training and validation datasets."""
         logger.info("Setting up datasets...")
         
-        # Create full dataset with dual-channel loading (TIFF + HEIC)
+        # Determine if we're using residuals
+        use_residuals = self.residual_path is not None
+        if use_residuals:
+            logger.info(f"Using pre-computed residuals from: {self.residual_path}")
+        
+        # Create full dataset with dual-channel loading (TIFF + HEIC) and optional residuals
         full_dataset = TiffVolumeDataset(
             data_path=self.data_path,
             volume_size=self.volume_size,
             stride=self.stride,
             num_frames=self.num_frames,
-            start_offset=0,
+            start_offset=self.start_offset,
             normalize=True,
             global_normalize=True,
             use_heic_compression=True,
             heic_quality=self.heic_quality,
             dual_channel=True,  # Load both TIFF and HEIC
+            use_residuals=use_residuals,
+            residuals_path=str(self.residual_path) if use_residuals else None,
             max_workers=self.max_workers,
         )
         
@@ -270,25 +296,39 @@ class HeicToTiffTrainer:
         # Custom collate function for dual-channel data
         def collate_fn(batch):
             """
-            Collate function that separates HEIC and TIFF channels.
+            Collate function that separates channels based on dataset configuration.
             
-            Input batch: List of (dual_channel_volume, positions)
-            - dual_channel_volume: (2, D, H, W) where dim 0 is [TIFF, HEIC]
+            Input batch: List of (volume, positions)
+            - volume: (2, D, H, W) if no residuals, where dim 0 is [TIFF, HEIC]
+                     (3, D, H, W) if residuals, where dim 0 is [TIFF, HEIC, RESIDUAL]
             - positions: (3,) tensor with [d_start, h_start, w_start]
             
             Returns:
-            - heic_volumes: (B, 1, D, H, W) - input to model
+            - model_inputs: (B, 2, D, H, W) - input to model [HEIC, RESIDUAL or zeros]
             - tiff_volumes: (B, 1, D, H, W) - target for model
             - positions: (B, 3) - positional information
             """
-            dual_volumes = torch.stack([item[0] for item in batch])  # (B, 2, D, H, W)
-            positions = torch.stack([item[1] for item in batch])     # (B, 3)
+            volumes = torch.stack([item[0] for item in batch])  # (B, C, D, H, W) where C=2 or 3
+            positions = torch.stack([item[1] for item in batch])  # (B, 3)
             
-            # Split channels
-            tiff_volumes = dual_volumes[:, 0:1]  # (B, 1, D, H, W) - target
-            heic_volumes = dual_volumes[:, 1:2]  # (B, 1, D, H, W) - input
+            # Extract TIFF target (always channel 0)
+            tiff_volumes = volumes[:, 0:1]  # (B, 1, D, H, W)
             
-            return heic_volumes, tiff_volumes, positions
+            # Extract HEIC input (always channel 1)
+            heic_volumes = volumes[:, 1:2]  # (B, 1, D, H, W)
+            
+            # Extract or create second input channel
+            if volumes.shape[1] == 3:
+                # Residuals available (channel 2)
+                residual_volumes = volumes[:, 2:3]  # (B, 1, D, H, W)
+            else:
+                # No residuals, use zeros
+                residual_volumes = torch.zeros_like(heic_volumes)
+            
+            # Concatenate for model input: [HEIC, RESIDUAL]
+            model_inputs = torch.cat([heic_volumes, residual_volumes], dim=1)  # (B, 2, D, H, W)
+            
+            return model_inputs, tiff_volumes, positions
         
         # Create data loaders
         self.train_dataloader = DataLoader(
@@ -315,34 +355,64 @@ class HeicToTiffTrainer:
         """Setup the UNet3D model and related components."""
         logger.info("Setting up model...")
 
-        # Initialize UNet3D model
-        self.model = UNet3DConditionModel(
-            sample_size=self.volume_size,
-            in_channels=2,  # HEIC input
-            out_channels=1, # TIFF output
-            layers_per_block=2,
-            block_out_channels=(64, 128, 128, 256),
-            down_block_types=(
-                "DownBlock3D",
-                "DownBlock3D", 
-                "CrossAttnDownBlock3D",
-                "DownBlock3D",
-            ),
-            up_block_types=(
-                "UpBlock3D",
-                "CrossAttnUpBlock3D",
-                "UpBlock3D",
-                "UpBlock3D",
-            ),
-            cross_attention_dim=768,  # Dimension for positional encoding
-            attention_head_dim=64,
-        )
-        
-        # Initialize positional encoder
-        self.positional_encoder = PositionalEncoder(
-            d_model=768,  # Match cross_attention_dim
-            max_position=max(1000, self.volume_size * 4)  # Allow for larger volumes
-        )
+        # Check if resuming from checkpoint
+        if self.resume_from_checkpoint and self.resume_from_checkpoint.exists():
+            logger.info(f"Loading model from checkpoint: {self.resume_from_checkpoint}")
+            
+            # Load UNet3D model from checkpoint
+            unet_path = self.resume_from_checkpoint / "unet"
+            if unet_path.exists():
+                self.model = UNet3DConditionModel.from_pretrained(unet_path)
+                logger.info("UNet3D model loaded from checkpoint")
+            else:
+                raise ValueError(f"UNet checkpoint not found at {unet_path}")
+            
+            # Load positional encoder
+            pos_encoder_path = self.resume_from_checkpoint / "positional_encoder.pth"
+            self.positional_encoder = PositionalEncoder(
+                d_model=768,
+                max_position=max(1000, self.volume_size * 4)
+            )
+            if pos_encoder_path.exists():
+                self.positional_encoder.load_state_dict(torch.load(pos_encoder_path))
+                logger.info("Positional encoder loaded from checkpoint")
+            else:
+                logger.warning(f"Positional encoder not found at {pos_encoder_path}, using new initialization")
+            
+        else:
+            # Initialize new models
+            if self.resume_from_checkpoint:
+                logger.warning(f"Checkpoint path provided but not found: {self.resume_from_checkpoint}")
+                logger.info("Initializing new model instead")
+            
+            # Initialize UNet3D model
+            self.model = UNet3DConditionModel(
+                sample_size=self.volume_size,
+                in_channels=2,  # HEIC input
+                out_channels=1, # TIFF output
+                layers_per_block=2,
+                block_out_channels=(64, 128, 128, 256),
+                down_block_types=(
+                    "DownBlock3D",
+                    "DownBlock3D", 
+                    "CrossAttnDownBlock3D",
+                    "DownBlock3D",
+                ),
+                up_block_types=(
+                    "UpBlock3D",
+                    "CrossAttnUpBlock3D",
+                    "UpBlock3D",
+                    "UpBlock3D",
+                ),
+                cross_attention_dim=768,  # Dimension for positional encoding
+                attention_head_dim=64,
+            )
+            
+            # Initialize positional encoder
+            self.positional_encoder = PositionalEncoder(
+                d_model=768,  # Match cross_attention_dim
+                max_position=max(1000, self.volume_size * 4)  # Allow for larger volumes
+            )
         
         # Initialize loss function
         self.loss_fn = HeicToTiffLoss(
@@ -386,6 +456,28 @@ class HeicToTiffTrainer:
             milestones=[self.warmup_steps]
         )
         
+        # Load optimizer and scheduler state if resuming
+        if self.resume_from_checkpoint and self.resume_from_checkpoint.exists() and not self.reset_optimizer:
+            training_state_path = self.resume_from_checkpoint / "training_state.pth"
+            if training_state_path.exists():
+                logger.info("Loading optimizer and scheduler state from checkpoint")
+                training_state = torch.load(training_state_path)
+                
+                self.optimizer.load_state_dict(training_state['optimizer_state_dict'])
+                self.scheduler.load_state_dict(training_state['scheduler_state_dict'])
+                self.global_step = training_state.get('step', 0)
+                
+                # Calculate which epoch to start from
+                steps_per_epoch = len(self.train_dataloader)
+                self.start_epoch = self.global_step // steps_per_epoch
+                
+                logger.info(f"Resuming from step {self.global_step}, epoch {self.start_epoch}")
+            else:
+                logger.warning(f"Training state not found at {training_state_path}, starting optimizer from scratch")
+        elif self.resume_from_checkpoint and self.reset_optimizer:
+            logger.info("Reset optimizer flag set: using fresh optimizer state (model weights still loaded)")
+            # Keep global_step and start_epoch at 0 (default values)
+        
         logger.info(f"Optimizer and scheduler set up for {total_steps} total steps")
     
     def setup_accelerator(self):
@@ -420,14 +512,15 @@ class HeicToTiffTrainer:
         Perform a single training step.
         
         Args:
-            batch: Tuple of (heic_volumes, tiff_volumes, positions)
+            batch: Tuple of (model_inputs, tiff_volumes, positions)
             
         Returns:
             Dictionary of losses
         """
-        heic_volumes, tiff_volumes, positions = batch
-
-        inputs = torch.cat([heic_volumes, torch.zeros_like(heic_volumes)], dim=1)
+        model_inputs, tiff_volumes, positions = batch
+        
+        # model_inputs is already (B, 2, D, H, W) with [HEIC, RESIDUAL or zeros]
+        # No need to concatenate zeros anymore
         
         # Generate positional encodings
         encoder_hidden_states = self.positional_encoder(positions)  # (B, 768)
@@ -435,10 +528,10 @@ class HeicToTiffTrainer:
         
         # Forward pass through UNet
         with self.accelerator.accumulate(self.model):
-            # Predict TIFF from HEIC
+            # Predict TIFF from HEIC + residual
             predicted_tiff = self.model(
-                sample=inputs,
-                timestep=torch.zeros(heic_volumes.shape[0], device=heic_volumes.device),  # No timestep for direct translation
+                sample=model_inputs,
+                timestep=torch.zeros(model_inputs.shape[0], device=model_inputs.device),  # No timestep for direct translation
                 encoder_hidden_states=encoder_hidden_states,
             ).sample
             
@@ -462,22 +555,22 @@ class HeicToTiffTrainer:
         Perform a single validation step.
         
         Args:
-            batch: Tuple of (heic_volumes, tiff_volumes, positions)
+            batch: Tuple of (model_inputs, tiff_volumes, positions)
             
         Returns:
             Dictionary of losses
         """
-        heic_volumes, tiff_volumes, positions = batch
+        model_inputs, tiff_volumes, positions = batch
         
         # Generate positional encodings
         encoder_hidden_states = self.positional_encoder(positions)  # (B, 768)
         encoder_hidden_states = encoder_hidden_states.unsqueeze(1)  # (B, 1, 768)
         
         with torch.no_grad():
-            # Predict TIFF from HEIC
+            # Predict TIFF from HEIC + residual
             predicted_tiff = self.model(
-                sample=heic_volumes,
-                timestep=torch.zeros(heic_volumes.shape[0], device=heic_volumes.device),
+                sample=model_inputs,
+                timestep=torch.zeros(model_inputs.shape[0], device=model_inputs.device),
                 encoder_hidden_states=encoder_hidden_states,
             ).sample
             
@@ -552,10 +645,10 @@ class HeicToTiffTrainer:
         self.setup_accelerator()
         
         # Training loop
-        global_step = 0
+        global_step = self.global_step  # Resume from checkpoint if applicable
         self.model.train()
         
-        for epoch in range(self.num_epochs):
+        for epoch in range(self.start_epoch, self.num_epochs):
             logger.info(f"Starting epoch {epoch + 1}/{self.num_epochs}")
             
             epoch_losses = {}
@@ -638,6 +731,8 @@ def main():
                       help="Stride for sub-volume extraction")
     parser.add_argument("--num_frames", type=int, default=32,
                       help="Number of TIFF frames to load")
+    parser.add_argument("--start_offset", type=int, default=150,
+                      help="Starting frame offset for dataset")
     
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=4,
@@ -652,6 +747,14 @@ def main():
     # HEIC arguments
     parser.add_argument("--heic_quality", type=int, default=50,
                       help="HEIC compression quality")
+    parser.add_argument("--residual_path", type=str, default=None,
+                      help="Path to pre-computed residuals file (optional)")
+    
+    # Checkpoint arguments
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                      help="Path to checkpoint directory to resume training from")
+    parser.add_argument("--reset_optimizer", action="store_true",
+                      help="Reset optimizer when resuming (keep model weights, reset optimizer state)")
     
     # System arguments
     parser.add_argument("--max_workers", type=int, default=8,
@@ -691,11 +794,15 @@ def main():
         volume_size=args.volume_size,
         stride=args.stride,
         num_frames=args.num_frames,
+        start_offset=args.start_offset,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         num_epochs=args.num_epochs,
         validation_split=args.validation_split,
         heic_quality=args.heic_quality,
+        residual_path=args.residual_path,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        reset_optimizer=args.reset_optimizer,
         max_workers=args.max_workers,
         mixed_precision=args.mixed_precision if args.mixed_precision != "no" else None,
         gradient_accumulation_steps=args.gradient_accumulation_steps,

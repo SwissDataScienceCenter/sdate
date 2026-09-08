@@ -94,19 +94,44 @@ REGISTRY = {
         deg_per_frame=0.900452, rot_axis_col=252.3,
         crop=(256, 480), frame_start=90_000, frame_end=210_000,
     ),
-    "synthetic_v1": DatasetProfile(
-        name="synthetic_v1",
-        mov_path=f"{_TR}/synthetic_v1/synthetic_v1.mov",
-        memmap_path=f"{_TR}/synthetic_v1/frames_0_100000.u16",
+    "synthetic_v3": DatasetProfile(
+        name="synthetic_v3",
+        mov_path=f"{_TR}/synthetic_v3/synthetic_v3.mov",
+        memmap_path=f"{_TR}/synthetic_v3/frames_0_100000.u16",
         fps=30.0, height=128, width=512,
-        # Exactly 2 deg/frame -> period_360 = 180 frames EXACTLY (unlike every
-        # real dataset above): same-angle temporal taps land on integer frames,
-        # no sub-frame interpolation, isolating that confound from the
-        # real-dataset ablations. Native width == crop width -> axis_col at the
-        # exact centre makes the crop a no-op (see phantom.py's coordinate
-        # convention: world 0 <-> pixel (width-1)/2).
+        # Same geometry as synthetic_v1/v2 -- v2's sparse "moving objects" (even
+        # at 5-11px) always left a large/lucky-overlap feature that survived
+        # noise as a visible anchor, so the noisy-vs-denoised contrast never
+        # matched the dramatic "unusable -> usable" story real datasets show.
+        # phantom.default_scene is now a densely-packed granular/foam phantom:
+        # ~1800 grains with a narrow bounded size range (no outliers) filling
+        # ~90%+ of the FOV, plus a handful of large-scale coarse features
+        # layered on top for realism. At the standard dose=0.05 the noisy FBP
+        # recon is already unreadable; dose=0.025 (40x) is the agreed target.
         deg_per_frame=2.0, rot_axis_col=511 / 2.0,
         crop=(128, 512), frame_start=0, frame_end=100_000,
         norm_range=(0.0, 700.0),
+    ),
+    "synthetic_wk2geom": DatasetProfile(
+        name="synthetic_wk2geom",
+        mov_path=f"{_TR}/synthetic_wk2geom/synthetic_wk2geom.mov",
+        memmap_path=f"{_TR}/synthetic_wk2geom/frames_0_100000.u16",
+        fps=30.0, height=128, width=512,
+        # Same phantom/scene as synthetic_v3 (see generate_synthetic_phantom.py --
+        # default_scene doesn't depend on deg_per_frame), but rendered at
+        # wunderkerze2's OWN calibrated (non-integer-period) rotation rate instead
+        # of synthetic_v3's exact 180-frame period, so temporal-tap interpolation
+        # sees the same fractional bracketing real wunderkerze2 training does.
+        # This is the ONLY geometry change from synthetic_v3 -- height/width/crop/
+        # rot_axis_col deliberately kept identical (crop==native width here, so
+        # rot_axis_col is a no-op at train time either way).
+        deg_per_frame=1.801402, rot_axis_col=511 / 2.0,
+        crop=(128, 512), frame_start=0, frame_end=100_000,
+        # Matched to the real wunderkerze2 poisson_head baseline checkpoint's own
+        # fitted norm_min/max (tr_denoise_baseline_k1_dose005_poissonhead_config.json),
+        # so a noise2clean checkpoint trained here isn't ALSO confounded by a raw
+        # count-scale mismatch when later run on real data (on top of the domain
+        # gap that's actually being tested).
+        norm_range=(116.737, 709.796),
     ),
 }

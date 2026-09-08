@@ -31,7 +31,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .data import _center_crop
+from .data import _center_crop, resolve_warped_context_dir
 from .frames import MemmapFrameSource
 from .geometry import DEG_PER_FRAME, PERIOD_180, ROT_AXIS_COL
 from .noise import add_poisson_noise
@@ -46,13 +46,28 @@ ARMS = ("GT", "denoised", "noisy")
 @torch.no_grad()
 def denoise_sequence(ckpt, mov_path, memmap_path, out_path,
                      frame_start: int = 400_000, frame_end: int = 500_000,
-                     dose: float = 0.05, noise_seed: int = 12345, ss_timestep: int = 500,
+                     dose: float = 0.05, native_noise: bool = False, noise_seed: int = 12345, ss_timestep: int = 500,
                      num_samples: int = 1, n2n_q: float = 1.0,
                      diffusion_inference: str = "single_shot", ancestral_num_steps: int = 50,
                      batch: int = 64, num_workers: int = 8,
                      deg_per_frame: float = DEG_PER_FRAME, axis_col: float = ROT_AXIS_COL,
+                     poisson_posterior: bool = True, var_out_path: Optional[str] = None,
                      device: Optional[torch.device] = None, log_every: int = 50):
     """Denoise every usable frame and cache counts to a memmap.
+
+    ``poisson_posterior`` (poisson_head checkpoints only): ``True`` (default)
+    -- the exact Gamma-Poisson posterior-mean combination (sharper); ``False``
+    -- ``mu`` alone, the single-head-equivalent point estimate. See
+    :func:`sdate.tr_diffusion.pipeline.denoise_frames_baseline`.
+
+    ``var_out_path`` (poisson_head + ``poisson_posterior=True`` checkpoints
+    only): if given, ALSO writes the exact posterior variance (``var_post``
+    from :func:`sdate.tr_diffusion.nb_head.posterior_mean`, raw count² units,
+    NOT renormalised -- see ``return_uncertainty`` in
+    :func:`sdate.tr_diffusion.pipeline.denoise_frames_baseline`) to a second
+    float16 memmap, same ``first_index``/``num_frames``/``crop`` convention as
+    the primary (mean) output. This is the per-pixel heteroscedastic noise
+    map an Ambient-Tweedie-style consumer needs alongside the mean.
 
     Model type is auto-detected from ``ckpt``'s config (``mode``: baseline/diffusion,
     ``denoise_mode``: n2v/n2n, default n2v for older checkpoints):
@@ -72,8 +87,15 @@ def denoise_sequence(ckpt, mov_path, memmap_path, out_path,
       initialised from the noisy measurement — see
       :func:`sdate.tr_diffusion.pipeline.partial_diffusion_n2n`).
 
-    Input is the dose-noised frame (deterministic per-frame noise). Writes
-    ``out_path`` float16 ``(n_usable, H, W)`` + ``out_path + '.meta.npz'``.
+    Input is the dose-noised frame (deterministic per-frame noise), UNLESS
+    ``native_noise=True`` -- then the central/context frames are the raw
+    measured counts as-is (no synthetic Poisson thinning at all), matching a
+    checkpoint trained with ``--extra_noise_dose`` omitted (see
+    scripts/tr_diffusion_jointfbp_context_cache.py's own ``--native_noise``
+    convention). ``dose`` still controls ``poisson_dose`` for the posterior-
+    mean combination (pass ``1.0`` for native, the correct rate-relationship
+    regardless of ``native_noise``) and is recorded in the output meta either
+    way. Writes ``out_path`` float16 ``(n_usable, H, W)`` + ``out_path + '.meta.npz'``.
     Returns ``(first_index, num_frames, config)``.
     """
     from torch.utils.data import DataLoader
@@ -81,29 +103,74 @@ def denoise_sequence(ckpt, mov_path, memmap_path, out_path,
     from .data import TimeResolvedFrameDataset
     from .load import load_denoiser
     from .pipeline import (
-        denoise_frames_baseline, denoise_frames_n2n_baseline,
-        partial_diffusion_n2n, pred_x0_ensemble, pred_x0_n2n_ensemble, pred_x0_n2n_swap_ensemble,
+        denoise_frames_baseline, denoise_frames_bootstrap, denoise_frames_bootstrap_reverse,
+        denoise_frames_n2n_baseline, denoise_frames_noise2clean, denoise_frames_refine,
+        denoise_frames_sinogram, partial_diffusion_n2n, pred_x0_ensemble, pred_x0_n2n_ensemble,
+        pred_x0_n2n_swap_ensemble,
     )
+    from .sino_transform import SinoTransform
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, cfg = load_denoiser(ckpt, device=device)
     mode = cfg.get("mode", "baseline")
     denoise_mode = cfg.get("denoise_mode", "n2v")
-    crop = tuple(cfg["crop"])
+
+    # --mode bootstrap, direction="forward": `cfg` describes the (k=0, context-free)
+    # bootstrap model itself, but the DATASET below must match the FROZEN base
+    # checkpoint's own shape (k, crop, neighborhoods, ...) since it's the base model
+    # that actually consumes the multi-frame context -- see train.py's --mode bootstrap
+    # geometry-inheritance block. direction="reverse" needs neither the base model nor
+    # its context at inference (the model consumes the raw measurement directly), so it
+    # uses `cfg`'s own (k=0) geometry -- a plain single-frame dataset, no base checkpoint load.
+    # --mode refine (angular-resolution-gap experiment, "Leg 1"): unlike bootstrap, `cfg`
+    # describes the SAME geometry the frozen base checkpoint has (train.py's --mode refine
+    # geometry-inheritance block copies it verbatim), so `ds_cfg = cfg` works directly --
+    # it just ALSO needs `base_model` loaded and `warped_context_dir` resolved.
+    base_model = None
+    bootstrap_direction = cfg.get("bootstrap_direction", "forward")
+    if mode == "bootstrap" and bootstrap_direction == "forward":
+        base_model, base_cfg = load_denoiser(cfg["base_checkpoint"], device=device)
+        ds_cfg = base_cfg
+        bootstrap_input_mode = cfg.get("bootstrap_input", "mean")
+        bootstrap_present = float(base_cfg.get("conditioning_probability", 1.0)) > 0.0
+    elif mode == "refine":
+        base_model, base_cfg = load_denoiser(cfg["base_checkpoint"], device=device)
+        ds_cfg = cfg
+        refine_present = float(base_cfg.get("conditioning_probability", 1.0)) > 0.0
+    else:
+        ds_cfg = cfg
+
+    crop = tuple(ds_cfg["crop"])
     lo_n, hi_n = float(cfg["norm_min"]), float(cfg["norm_max"])
-    cond_angle_time = bool(cfg.get("cond_angle_time", False))
+    sino_transform = None
+    if mode == "sinogram":
+        sino_transform = SinoTransform(
+            crop, num_angles=int(cfg["sino_num_angles"]), det_cols=int(cfg["sino_det_cols"]),
+            angle_max_deg=float(cfg["sino_angle_max_deg"]), device=device,
+        )
+        sino_norm_min, sino_norm_max = float(cfg["sino_norm_min"]), float(cfg["sino_norm_max"])
+    cond_angle_time = bool(ds_cfg.get("cond_angle_time", False))
+    warped_temporal_memmaps = (
+        resolve_warped_context_dir(ds_cfg["warped_context_dir"], int(ds_cfg["k"]),
+                                   bool(ds_cfg.get("include_mirror", False)),
+                                   ds_cfg.get("neighborhoods", "both"),
+                                   bool(ds_cfg.get("temporal_raw_pairs", False)), deg_per_frame)
+        if ds_cfg.get("warped_context_dir") else None
+    )
     ds = TimeResolvedFrameDataset(
-        mov_path=mov_path, memmap_path=memmap_path, k=int(cfg["k"]),
+        mov_path=mov_path, memmap_path=memmap_path, k=int(ds_cfg["k"]),
         frame_start=frame_start, frame_end=frame_end, crop=crop,
-        neighborhoods=cfg.get("neighborhoods", "both"),
-        norm_range=(lo_n, hi_n), extra_noise_dose=dose, noise_seed=noise_seed,
+        neighborhoods=ds_cfg.get("neighborhoods", "both"),
+        norm_range=(lo_n, hi_n), extra_noise_dose=(None if native_noise else dose), noise_seed=noise_seed,
         axis_col=axis_col, deg_per_frame=deg_per_frame,
         cond_angle_time=cond_angle_time,
-        temporal_raw_pairs=bool(cfg.get("temporal_raw_pairs", False)),
-        # the checkpoint's OWN training range, NOT this call's (possibly different)
-        # eval frame_start/frame_end -- the model's time conditioning is calibrated
-        # to the training range only.
-        cond_frame_start=cfg.get("frame_start"), cond_frame_end=cfg.get("frame_end"),
+        warped_temporal_memmaps=warped_temporal_memmaps,
+        temporal_raw_pairs=bool(ds_cfg.get("temporal_raw_pairs", False)),
+        # the (base, for bootstrap) checkpoint's OWN training range, NOT this call's
+        # (possibly different) eval frame_start/frame_end -- the model's time conditioning
+        # is calibrated to the training range only.
+        cond_frame_start=ds_cfg.get("frame_start"), cond_frame_end=ds_cfg.get("frame_end"),
+        aux_channel_memmap=ds_cfg.get("aux_channel_memmap"),
     )
     first = int(ds.indices.min())
     n = int(ds.indices.max()) - first + 1
@@ -118,9 +185,25 @@ def denoise_sequence(ckpt, mov_path, memmap_path, out_path,
           (f" q={n2n_q}" if denoise_mode == "n2n" else f" present={present}") +
           (f" t={ss_timestep} num_samples={num_samples}" if mode != "baseline" else "") +
           (f" diffusion_inference={diffusion_inference} pred_type={n2n_prediction_type}"
-           if (denoise_mode == "n2n" and mode != "baseline") else ""), flush=True)
+           if (denoise_mode == "n2n" and mode != "baseline") else "") +
+          (f" bootstrap_direction={bootstrap_direction} bootstrap_input={bootstrap_input_mode} "
+           f"base_checkpoint={cfg.get('base_checkpoint')}"
+           if mode == "bootstrap" and bootstrap_direction == "forward" else
+           f" bootstrap_direction={bootstrap_direction}" if mode == "bootstrap" else
+           f" base_checkpoint={cfg.get('base_checkpoint')} warped_context_dir={cfg.get('warped_context_dir')}"
+           if mode == "refine" else "") +
+          (f" poisson_posterior={poisson_posterior}" if cfg.get("poisson_head", False) else "") +
+          (f" sino_shape=({sino_transform.num_angles},{sino_transform.det_cols}) "
+           f"sino_norm=({sino_norm_min:.2f},{sino_norm_max:.2f})" if mode == "sinogram" else ""), flush=True)
 
+    if var_out_path is not None and not (mode in ("baseline", "bootstrap", "refine") and cfg.get("poisson_head", False)
+                                         and poisson_posterior):
+        raise ValueError("var_out_path requires a poisson_head baseline/bootstrap/refine checkpoint with "
+                         "poisson_posterior=True (return_uncertainty is only meaningful for the exact "
+                         "posterior combination)")
     mm = np.memmap(out_path, dtype=np.float16, mode="w+", shape=(n, crop[0], crop[1]))
+    var_mm = (np.memmap(var_out_path, dtype=np.float16, mode="w+", shape=(n, crop[0], crop[1]))
+             if var_out_path is not None else None)
     loader = DataLoader(ds, batch_size=batch, shuffle=False, num_workers=num_workers,
                         pin_memory=True)
     done = 0
@@ -149,35 +232,100 @@ def denoise_sequence(ckpt, mov_path, memmap_path, out_path,
                                               num_samples=num_samples, p_bins=p_bins, chunk_size=64,
                                               prediction_type=n2n_prediction_type,
                                               norm_min=lo_n, norm_max=hi_n)
-        elif mode == "baseline":
+        elif mode in ("baseline", "context_only"):
+            # a --warped_context_dir baseline checkpoint (Leg 2, angular-resolution-gap
+            # experiment) was trained on context_warped, NOT the raw context every other
+            # baseline checkpoint uses -- see losses.py's BaselineN2VLoss.compute_loss,
+            # which does this exact swap at training time.
+            baseline_context = (item["context_warped"].to(device, non_blocking=True)
+                               if ds_cfg.get("warped_context_dir") else context)
             cond_channels = item["cond_channels"].to(device, non_blocking=True) if cond_angle_time else None
-            den = denoise_frames_baseline(model, central, context, present=present,
-                                          cond_channels=cond_channels)  # normalized [-1,1]
+            aux_channels = item["aux_channel"].to(device, non_blocking=True) if "aux_channel" in item else None
+            out = denoise_frames_baseline(model, central, baseline_context, present=present,
+                                          cond_channels=cond_channels, aux_channels=aux_channels,
+                                          poisson_head=bool(cfg.get("poisson_head", False)),
+                                          poisson_mean_only=(cfg.get("loss_type") == "poisson"),
+                                          poisson_posterior=poisson_posterior,
+                                          norm_min=lo_n, norm_max=hi_n, poisson_dose=dose,
+                                          return_uncertainty=var_mm is not None)  # normalized [-1,1] (+ raw var_post)
+            den, var_post = out if var_mm is not None else (out, None)
+        elif mode == "noise2clean":
+            den = denoise_frames_noise2clean(model, central, context)
+            var_post = None
+        elif mode == "bootstrap" and bootstrap_direction == "reverse":
+            out = denoise_frames_bootstrap_reverse(model, central, norm_min=lo_n, norm_max=hi_n,
+                                                    poisson_posterior=poisson_posterior, poisson_dose=dose,
+                                                    return_uncertainty=var_mm is not None)
+            den, var_post = out if var_mm is not None else (out, None)
+        elif mode == "bootstrap":
+            # NOTE: input_mode='sample' with a large num_samples (e.g. 64-draw averaging)
+            # multiplies the bootstrap model's forward-pass batch (num_samples * dataloader
+            # batch); chunk_size caps how many of those go through the UNet at once. Do NOT
+            # raise this casually -- even a single-channel input still runs through the full
+            # 6-stage/256-channel UNet, and a chunk_size=256 attempt OOM'd a 40GB GPU portion
+            # (needed >8GB for one allocation alone) at the function's own default of 32.
+            out = denoise_frames_bootstrap(model, base_model, central, context,
+                                           input_mode=bootstrap_input_mode, num_samples=num_samples,
+                                           present=bootstrap_present, norm_min=lo_n, norm_max=hi_n,
+                                           poisson_posterior=poisson_posterior, poisson_dose=dose,
+                                           return_uncertainty=var_mm is not None)
+            den, var_post = out if var_mm is not None else (out, None)
+        elif mode == "refine":
+            refine_context = item["context_warped"].to(device, non_blocking=True)
+            out = denoise_frames_refine(model, base_model, central, context, refine_context,
+                                        input_mode="sample", num_samples=num_samples,
+                                        present=refine_present, norm_min=lo_n, norm_max=hi_n,
+                                        poisson_posterior=poisson_posterior, poisson_dose=dose,
+                                        return_uncertainty=var_mm is not None)
+            den, var_post = out if var_mm is not None else (out, None)
+        elif mode == "sinogram":
+            den = denoise_frames_sinogram(model, sino_transform, central, context,
+                                          norm_min=lo_n, norm_max=hi_n,
+                                          sino_norm_min=sino_norm_min, sino_norm_max=sino_norm_max,
+                                          present=present)
+            var_post = None
         else:
             den, _ = pred_x0_ensemble(model, central, context, timestep=ss_timestep,
                                       num_samples=num_samples, chunk_size=64,
                                       ratio=cfg["n2v_ratio"], window=cfg["n2v_window"])
+            var_post = None
         counts = ((den.clamp(-1, 1) + 1) * 0.5 * (hi_n - lo_n) + lo_n)[:, 0]
         counts = counts.float().cpu().numpy().astype(np.float16)
+        if var_post is not None:
+            var_np = var_post[:, 0].float().cpu().numpy().astype(np.float16)
         for j, f in enumerate(fidx):
             mm[int(f) - first] = counts[j]
+            if var_mm is not None:
+                var_mm[int(f) - first] = var_np[j]
         done += len(fidx)
         if log_every and bi % log_every == 0:
             print(f"  denoised {done}/{n}", flush=True)
     mm.flush()
-    meta = dict(first_index=first, num_frames=n, crop=list(crop), dose=dose,
+    meta = dict(first_index=first, num_frames=n, crop=list(crop), dose=dose, native_noise=native_noise,
                 noise_seed=noise_seed, norm_min=lo_n, norm_max=hi_n,
                 ckpt=str(ckpt), mode=mode, denoise_mode=denoise_mode,
                 ss_timestep=ss_timestep, num_samples=num_samples, n2n_q=n2n_q,
-                diffusion_inference=diffusion_inference)
+                diffusion_inference=diffusion_inference, poisson_posterior=poisson_posterior,
+                # only present for --mode bootstrap -- omitted (not None) for every other mode so
+                # a plain np.load(...).meta.npz reader never has to allow_pickle for an object-dtype
+                # None field it was never going to look up anyway.
+                **({"bootstrap_direction": bootstrap_direction}
+                   if mode == "bootstrap" and bootstrap_direction == "reverse" else
+                   {"base_checkpoint": str(cfg["base_checkpoint"]), "bootstrap_input": bootstrap_input_mode,
+                    "bootstrap_direction": bootstrap_direction}
+                   if mode == "bootstrap" else {}))
     np.savez(str(out_path) + ".meta.npz", **meta)
     print(f"wrote denoised memmap {out_path}  ({n} frames {first}..{first+n-1})", flush=True)
+    if var_mm is not None:
+        var_mm.flush()
+        np.savez(str(var_out_path) + ".meta.npz", **{**meta, "content": "posterior_variance_raw_counts_sq"})
+        print(f"wrote posterior-variance memmap {var_out_path}  ({n} frames {first}..{first+n-1})", flush=True)
     return first, n, meta
 
 
 @torch.no_grad()
 def cascade_sequence(baseline_ckpt, src_memmap_path, out_path, batch: int = 64,
-                     deg_per_frame: float = DEG_PER_FRAME,
+                     deg_per_frame: float = DEG_PER_FRAME, poisson_posterior: bool = True,
                      device: Optional[torch.device] = None, log_every: int = 50):
     """Cascade denoiser: run the baseline on an already-denoised (e.g. diffusion
     single-shot) memmap, building the baseline's context from that same denoised
@@ -220,7 +368,11 @@ def cascade_sequence(baseline_ckpt, src_memmap_path, out_path, batch: int = 64,
                          else get(f + int(t.frame_offset)) for t in layout] for f in fb])
         cen_t = norm(torch.from_numpy(cen).to(device)).unsqueeze(1)
         ctx_t = norm(torch.from_numpy(ctx).to(device))
-        den = denoise_frames_baseline(model, cen_t, ctx_t)
+        den = denoise_frames_baseline(model, cen_t, ctx_t,
+                                      poisson_head=bool(cfg.get("poisson_head", False)),
+                                      poisson_mean_only=(cfg.get("loss_type") == "poisson"),
+                                      poisson_posterior=poisson_posterior,
+                                      norm_min=lo_n, norm_max=hi_n)
         counts = ((den.clamp(-1, 1) + 1) * 0.5 * (hi_n - lo_n) + lo_n)[:, 0].float().cpu().numpy().astype(np.float16)
         for j, f in enumerate(fb):
             mm[int(f) - lo_u] = counts[j]
@@ -340,7 +492,8 @@ def counts_to_attenuation(counts: torch.Tensor, I0: float, eps: float = 1.0) -> 
 
 
 def load_calibration_average(mov_path, crop: Tuple[int, int], axis_col: float,
-                             drop_first: int = 1, ffmpeg: str = "/myhome/bin/ffmpeg") -> np.ndarray:
+                             drop_first: int = 1, ffmpeg: str = "/myhome/bin/ffmpeg",
+                             height: Optional[int] = None, width: Optional[int] = None) -> np.ndarray:
     """Average a dark/flat calibration ``.mov`` to a low-noise ``(H, W)`` counts map.
 
     Drops the first ``drop_first`` frame(s) before averaging -- frame 0 is a
@@ -348,19 +501,27 @@ def load_calibration_average(mov_path, crop: Tuple[int, int], axis_col: float,
     flats streams (mean far off the rest of the sequence) -- then applies the
     same ``crop``/``axis_col`` window as the projection stream so the map lines
     up pixel-for-pixel with denoised/native projection tensors.
+
+    ``height``/``width`` are the calibration stream's NATIVE (pre-crop) decoded
+    frame size -- defaults to :data:`sdate.tr_diffusion.geometry.FRAME_H`/``FRAME_W``
+    (the wunderkerze2 native size) for backward compatibility; pass the
+    dataset's own profile ``height``/``width`` for any other dataset (they are
+    NOT necessarily the same as ``crop``, which is the post-crop target size).
     """
     import subprocess
 
     from .frames import denormalize, load_norm_sidecar
     from .geometry import FRAME_H, FRAME_W
 
+    height = FRAME_H if height is None else int(height)
+    width = FRAME_W if width is None else int(width)
     side = load_norm_sidecar(mov_path)
     n = side["per_frame_min"].shape[0]
     proc = subprocess.run(
         [ffmpeg, "-v", "error", "-i", str(mov_path), "-pix_fmt", "gray16le", "-f", "rawvideo", "pipe:1"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
     )
-    arr = np.frombuffer(proc.stdout, np.uint16).reshape(-1, FRAME_H, FRAME_W)
+    arr = np.frombuffer(proc.stdout, np.uint16).reshape(-1, height, width)
     assert arr.shape[0] == n, f"{mov_path}: decoded {arr.shape[0]} frames, sidecar has {n}"
     counts = np.stack([
         denormalize(arr[k], side["per_frame_min"][k], side["per_frame_max"][k]) for k in range(n)
@@ -383,6 +544,20 @@ def counts_to_attenuation_flatdark(counts: torch.Tensor, dark: torch.Tensor, fla
     span = (flat - dark).clamp_min(eps)
     transmission = ((counts - dark) / span).clamp_min(eps)
     return (-torch.log(transmission)).clamp_min(0.0)
+
+
+def attenuation_to_counts_flatdark(atten: torch.Tensor, dark: torch.Tensor, flat: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`counts_to_attenuation_flatdark`: ``count = dark + (flat-dark)*exp(-p)``.
+
+    Used to turn a SIMULATED/reprojected line-integral sinogram (e.g. the
+    forward-projection of a clean joint-FBP reconstruction, see
+    ``scripts/tr_diffusion_jointfbp_context_cache.py``) back into raw-counts
+    space, matching the convention every other cached projection memmap in
+    this project uses (so it can be consumed by the same normalisation /
+    dataset machinery as a real measurement, e.g. as an ``aux_channel_memmap``
+    context tap) -- not a real measurement, no noise is added.
+    """
+    return dark + (flat - dark) * torch.exp(-atten)
 
 
 def destripe_sinogram(atten: torch.Tensor, kernel: int = 31) -> torch.Tensor:
@@ -422,12 +597,22 @@ def bin_detector(x_vrc: torch.Tensor, b: int) -> torch.Tensor:
 def reconstruct(p_vrc: torch.Tensor, angles_deg: np.ndarray, det_bin: int = 2,
                 method: str = "fbp", filter_type: str = "hann",
                 gd_kwargs: Optional[dict] = None, vol_shape: Optional[Tuple[int, int, int]] = None,
-                device: Optional[torch.device] = None) -> torch.Tensor:
+                device: Optional[torch.device] = None, clamp: bool = True) -> torch.Tensor:
     """Reconstruct one window's volume from attenuation projections ``(V, R, C)``.
 
     ``det_bin`` bins the detector (and thus the in-plane resolution): ``2`` gives
     a ``(R/2, C/2, C/2)`` volume, ``1`` full resolution. ``method`` is ``"fbp"``
     (fast analytic) or ``"gd"`` (iterative gradient descent).
+
+    ``clamp`` (default ``True``, the long-standing behaviour) floors the volume at
+    0. Pass ``clamp=False`` whenever reconstructions are going to be LINEARLY
+    COMBINED -- e.g. averaging Noise2Inverse angular sub-reconstructions (see
+    :mod:`sdate.tr_diffusion.n2i`) or blending two arms: FBP itself is linear in
+    the projections, but ``clamp_min(0)`` is not, and a sparse-view
+    sub-reconstruction swings far more negative than a full-view one, so
+    clamping each one first biases their mean upward (measured: +12% relative L1
+    at K=2, +36% at K=4, versus the full-view reconstruction). Clamp once at the
+    end instead.
     """
     from astra_torch.lamino import fbp_reconstruction_masked, gd_reconstruction_masked
 
@@ -448,7 +633,7 @@ def reconstruct(p_vrc: torch.Tensor, angles_deg: np.ndarray, det_bin: int = 2,
         raise ValueError(f"method must be 'fbp' or 'gd', got {method!r}")
     if vol.dim() == 4:
         vol = vol.squeeze(0)
-    return vol.clamp_min(0.0)
+    return vol.clamp_min(0.0) if clamp else vol
 
 
 # --------------------------------------------------------------------------- #
@@ -532,14 +717,19 @@ def make_mask(h: int, w: int, radius_frac: float = 0.95) -> torch.Tensor:
 # movies (HevcGray10Streamer, same as other notebooks)
 # --------------------------------------------------------------------------- #
 def write_slice_movie(frames: List[torch.Tensor], out_path, vmin: float, vmax: float,
-                      q: int = 90) -> Path:
-    """Write a list of ``(H, W)`` slices as a gray10 HEVC ``.mov`` (windowed to [0,1])."""
+                      q: int = 90, preset_sw: str = "medium") -> Path:
+    """Write a list of ``(H, W)`` slices as a gray10 HEVC ``.mov`` (windowed to [0,1]).
+
+    ``preset_sw`` defaults to "medium" (not the encoder's own "veryslow" default)
+    -- these are inspection/result movies generated after long GPU sweeps, where
+    encode time matters more than squeezing out the last bit of compression.
+    """
     from ..stream_hvec.stream_gray10 import EncoderParams, HevcGray10Streamer, concat_hevc_segments
 
     out_path = Path(out_path)
     # Force software libx265 (this Linux ffmpeg has no hevc_videotoolbox hardware encoder).
     st = HevcGray10Streamer(out_path.parent, segment_prefix=out_path.stem,
-                            params=EncoderParams(force_software=True))
+                            params=EncoderParams(force_software=True, preset_sw=preset_sw))
     span = max(vmax - vmin, 1e-6)
     with st.start_segment(q=q):
         for s in frames:
@@ -553,6 +743,7 @@ def write_projection_movie(mov_path, memmap_path, denoised, out_path,
                            frame_start: int, frame_end: int, dose: float,
                            crop: Optional[Tuple[int, int]] = None, axis_col: float = ROT_AXIS_COL,
                            noise_seed: int = 12345, chunk: int = 200, q: int = 90,
+                           preset_sw: str = "medium",
                            device: Optional[torch.device] = None) -> Tuple[Path, List[str]]:
     """Render a GT | denoised... | noisy movie of raw 2D projection FRAMES over time.
 
@@ -580,22 +771,35 @@ def write_projection_movie(mov_path, memmap_path, denoised, out_path,
              *(firsts[n] + mms[n].shape[0] for n in variants))
     arms = ["GT"] + list(variants) + ["noisy"]
 
-    frames: List[torch.Tensor] = []
-    vmin = vmax = None
-    for c0 in range(lo, hi, chunk):
-        idx = np.arange(c0, min(c0 + chunk, hi))
-        gt = native_window_gpu(src, idx, crop, axis_col, device)
-        if vmin is None:
-            lo_p, hi_p = np.percentile(gt.detach().cpu().numpy(), [1, 99])
-            vmin, vmax = float(lo_p), float(hi_p)
-        g = torch.Generator(device=device).manual_seed(int(noise_seed) + int(c0))
-        noisy = noisy_window_gpu(gt, dose, generator=g)
-        dens = [denoised_window_gpu(mms[name], firsts[name], idx, device) for name in variants]
-        combo = torch.cat([gt] + dens + [noisy], dim=-1)
-        frames.extend(combo[i].detach().cpu() for i in range(combo.shape[0]))
+    # Stream straight to the HEVC encoder chunk-by-chunk instead of buffering every
+    # frame of the whole movie in a Python list first: at full resolution this is
+    # ~1 MB/frame (4 panels x 128x512 float32), and a full wunderkerze2-range render
+    # is ~50k frames -- buffering the lot is a ~50 GB RAM spike (confirmed: this
+    # caused a real OOM/crash on the shared server), vs. a few hundred MB for one
+    # `chunk`-sized batch at a time.
+    from ..stream_hvec.stream_gray10 import EncoderParams, HevcGray10Streamer, concat_hevc_segments
 
-    write_slice_movie(frames, out_path, vmin, vmax, q=q)
-    return Path(out_path), arms
+    out_path = Path(out_path)
+    st = HevcGray10Streamer(out_path.parent, segment_prefix=out_path.stem,
+                            params=EncoderParams(force_software=True, preset_sw=preset_sw))
+    vmin = vmax = span = None
+    with st.start_segment(q=q):
+        for c0 in range(lo, hi, chunk):
+            idx = np.arange(c0, min(c0 + chunk, hi))
+            gt = native_window_gpu(src, idx, crop, axis_col, device)
+            if vmin is None:
+                lo_p, hi_p = np.percentile(gt.detach().cpu().numpy(), [1, 99])
+                vmin, vmax = float(lo_p), float(hi_p)
+                span = max(vmax - vmin, 1e-6)
+            g = torch.Generator(device=device).manual_seed(int(noise_seed) + int(c0))
+            noisy = noisy_window_gpu(gt, dose, generator=g)
+            dens = [denoised_window_gpu(mms[name], firsts[name], idx, device) for name in variants]
+            combo = torch.cat([gt] + dens + [noisy], dim=-1)
+            normed = ((combo.float() - vmin) / span).clamp(0.0, 1.0)
+            for i in range(normed.shape[0]):
+                st.append_frame(normed[i].detach().cpu().contiguous())
+    concat_hevc_segments(st.segments, str(out_path))
+    return out_path, arms
 
 
 def run_windows(mov_path, memmap_path, denoised,

@@ -41,9 +41,31 @@ def build_model(config: Dict):
     neighborhoods = config.get("neighborhoods", "both")
     extra_cond_channels = ANGLE_TIME_COND_CHANNELS if config.get("cond_angle_time", False) else 0
     temporal_raw_pairs = bool(config.get("temporal_raw_pairs", False))
-    fn = create_diffusion_unet if mode == "diffusion" else create_baseline_unet
-    return fn(k=k, sample_size=crop, include_mirror=include_mirror, neighborhoods=neighborhoods,
-             extra_cond_channels=extra_cond_channels, temporal_raw_pairs=temporal_raw_pairs)
+    if mode == "diffusion":
+        return create_diffusion_unet(k=k, sample_size=crop, include_mirror=include_mirror,
+                                     neighborhoods=neighborhoods, extra_cond_channels=extra_cond_channels,
+                                     temporal_raw_pairs=temporal_raw_pairs)
+    if mode == "ambient_tweedie":
+        # condition_on_measurement=False, extra_cond_channels=0: the network's input
+        # is x_t alone (+ context, if k>0 -- current recipe forces k=0) -- neither y
+        # nor sigma_tn_map is ever fed in, see the module docstring in ambient_tweedie.py.
+        return create_diffusion_unet(k=k, sample_size=crop, include_mirror=include_mirror,
+                                     neighborhoods=neighborhoods, extra_cond_channels=0,
+                                     temporal_raw_pairs=temporal_raw_pairs, condition_on_measurement=False)
+    poisson_head = bool(config.get("poisson_head", False))
+    # aux_channel_memmap (the noise2clean cross-domain channel, or the newer
+    # multi-tap joint-FBP-context channels; see data.py's aux_channel_memmap/
+    # losses.py's BaselineN2VLoss) is extra baseline INPUT channel(s), same
+    # mechanism as cond_angle_time -- must be accounted for here too, or a
+    # checkpoint trained with it would rebuild with the wrong in_channels and
+    # fail load_state_dict. Older checkpoints saved a single path string
+    # (1 channel); train.py's CLI now accepts a list (N channels) -- handle both.
+    aux = config.get("aux_channel_memmap")
+    if aux:
+        extra_cond_channels += len(aux) if isinstance(aux, list) else 1
+    return create_baseline_unet(k=k, sample_size=crop, include_mirror=include_mirror, neighborhoods=neighborhoods,
+                                extra_cond_channels=extra_cond_channels, temporal_raw_pairs=temporal_raw_pairs,
+                                poisson_head=poisson_head)
 
 
 def _load_checkpoint_with_retry(checkpoint_path, retries: int = 3, delay: float = 2.0):

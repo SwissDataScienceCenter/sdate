@@ -23,7 +23,9 @@ BaseLimitedAngleReconstructions:
 """
 from __future__ import annotations
 
+import json
 import math
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
@@ -37,6 +39,7 @@ from astra_torch.lamino import (
     fbp_reconstruction_masked,
     gd_reconstruction_masked,
 )
+from inct.dataset_slices import ProjectionSliceDataset
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +74,10 @@ class LimitedAngleConfig:
         uniform-spread behaviour (one slice every H/n_slices rows).
     height_indices : list[int] | None
         Explicit height row indices to use as slices.  If None, rows are
-        chosen using ``height_skip`` starting from row 0.
+        chosen using ``height_skip`` starting from row ``height_offset``.
+    height_offset : int
+        First height row index used when auto-generating slices (default 0).
+        Ignored when ``height_indices`` is provided explicitly.
     """
     n_slices: int = 15
     k_angles: int = 100
@@ -82,6 +88,7 @@ class LimitedAngleConfig:
     start_angle_offset: int = 0
     height_skip: int = 0
     height_indices: Optional[list] = None
+    height_offset: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -195,10 +202,10 @@ def build_limited_angle_dataset(
         height_indices = np.array(config.height_indices, dtype=int)
     else:
         # stride = 1 + height_skip rows per step
-        # skip=0 → consecutive: 0, 1, 2, ...
-        # skip=s → 0, 1+s, 2*(1+s), ...
+        # skip=0 → consecutive: offset, offset+1, offset+2, ...
+        # skip=s → offset, offset+1+s, offset+2*(1+s), ...
         stride = 1 + config.height_skip
-        height_indices = np.arange(config.n_slices, dtype=int) * stride
+        height_indices = config.height_offset + np.arange(config.n_slices, dtype=int) * stride
     assert len(height_indices) == config.n_slices
 
     # ── Compute per-slice angle indices ------------------------------------
@@ -288,6 +295,9 @@ class BaseLimitedAngleReconstructions(Dataset):
         ``(start, stop)`` of the angular sweep in degrees. Default (0, 180).
     height_skip : int, optional
         Rows skipped between consecutive slices (see ``LimitedAngleConfig``).
+    height_offset : int, optional
+        Height row index of the first slice when auto-generating indices
+        (default 0).  Ignored when ``height_indices`` is provided.
     height_indices : list[int] | None, optional
         Explicit height-row indices for the slices.
     det_spacing_mm : float, optional
@@ -299,6 +309,18 @@ class BaseLimitedAngleReconstructions(Dataset):
     transform : callable | None, optional
         Optional transform applied to the reconstructed (ny, nx) tensor before
         it is returned by ``__getitem__``.
+    gap : int, optional
+        Stride between consecutive window start indices.  ``gap=1`` (default)
+        yields every possible window; ``gap=k`` yields windows whose starts are
+        ``0, k, 2k, …``, reducing the dataset size by a factor of *k* while
+        increasing diversity between adjacent samples.
+    num_frames : int, optional
+        Number of consecutive temporal frames returned per sample.
+        When ``num_frames=1`` (default) each item is a 2-D ``(ny, nx)``
+        reconstruction (original behaviour).  When ``num_frames > 1`` each
+        item is a ``(num_frames, ny, nx)`` tensor of FBP reconstructions
+        whose sliding-window starts are spaced ``k_angles`` apart, capturing
+        temporal dynamics across neighbouring time slices.
 
     Notes
     -----
@@ -317,17 +339,22 @@ class BaseLimitedAngleReconstructions(Dataset):
         k_angles: int,
         angular_range_deg: Tuple[float, float] = (0.0, 180.0),
         height_skip: int = 0,
+        height_offset: int = 0,
         height_indices: Optional[List[int]] = None,
         det_spacing_mm: float = 1.0,
         filter_type: str = "hann",
         device: Optional[torch.device] = None,
         transform: Optional[Callable] = None,
+        gap: int = 1,
+        num_frames: int = 1,
     ) -> None:
         super().__init__()
 
         self.det_spacing_mm = det_spacing_mm
         self.filter_type = filter_type
         self.transform = transform
+        self._gap = max(1, gap)
+        self._num_frames = max(1, num_frames)
         self.device = device or (
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
@@ -343,12 +370,15 @@ class BaseLimitedAngleReconstructions(Dataset):
             use_attenuation=True,
         )
 
+        self._projectionSliceDataset = dataset  # keep reference to avoid re-loading volume
+
         la_config = LimitedAngleConfig(
             n_slices=n_slices,
             k_angles=k_angles,
             total_projections=num_projections,
             angular_range_deg=angular_range_deg,
             height_skip=height_skip,
+            height_offset=height_offset,
             height_indices=height_indices,
         )
 
@@ -388,16 +418,158 @@ class BaseLimitedAngleReconstructions(Dataset):
         # Window size = full number of projection angles (len(all_angles_deg))
         self._window_size: int = len(la_data.all_angles_deg)
         self._total_len: int = total_len
-        self._n_samples: int = max(0, total_len - self._window_size + 1)
+        # Additional span for multi-frame: (num_frames-1) * k_angles
+        frame_span = (self._num_frames - 1) * k_angles
+        n_valid = total_len - self._window_size - frame_span  # last valid start index
+        self._n_samples: int = max(0, n_valid // self._gap + 1) if total_len >= self._window_size + frame_span else 0
         self.vol_shape: Tuple[int, int] = la_data.vol_shape  # (W, W)
+
+        # ── Normalization calibration ──────────────────────────────────────
+        self.norm_scale: float = self._calibrate_normalization(data_path)
+
+    # ------------------------------------------------------------------
+    def get_projection_slice_dataset(self) -> ProjectionSliceDataset:
+        """Return the underlying ProjectionSliceDataset used to build this dataset."""
+        return self._projectionSliceDataset
+
+    def _calibrate_normalization(
+        self,
+        data_path: Union[str, Path],
+        n_calibration_samples: int = 5,
+    ) -> float:
+        """Sample a few FBP reconstructions and compute a normalization scale.
+
+        The scale factor maps the typical reconstruction range to ~[0, 1] by
+        using the reciprocal of the 99th percentile across the sampled images.
+        The value is cached to a JSON file alongside the dataset so that it
+        only needs to be computed once per dataset configuration.
+
+        Returns
+        -------
+        norm_scale : float
+            Multiplicative factor: ``normalized = reconstruction * norm_scale``.
+        """
+        config_dir = Path(data_path)
+        config_file = config_dir / "ladiff_norm_config.json"
+
+        # ── Try to load from cache ────────────────────────────────────────
+        if config_file.exists():
+            try:
+                with open(config_file, "r") as f:
+                    cfg = json.load(f)
+                cached_scale = float(cfg["norm_scale"])
+                warnings.warn(
+                    f"[BaseLimitedAngleReconstructions] Using cached normalization "
+                    f"scale = {cached_scale:.4f} (from {config_file}). "
+                    f"Reconstructions will be multiplied by this factor to map "
+                    f"them to ~[0, 1].",
+                    stacklevel=2,
+                )
+                return cached_scale
+            except (KeyError, ValueError, json.JSONDecodeError):
+                pass  # re-calibrate
+
+        # ── Calibrate from samples ────────────────────────────────────────
+        if self._n_samples == 0:
+            warnings.warn(
+                "[BaseLimitedAngleReconstructions] No samples available for "
+                "normalization calibration. Using norm_scale=1.0.",
+                stacklevel=2,
+            )
+            return 1.0
+
+        n_cal = min(n_calibration_samples, self._n_samples)
+        # Spread calibration samples evenly across the dataset
+        cal_indices = np.linspace(0, self._n_samples - 1, n_cal, dtype=int)
+
+        print(f"[BaseLimitedAngleReconstructions] Calibrating normalization "
+              f"from {n_cal} sample reconstructions...")
+
+        pixel_values = []
+        for i in cal_indices:
+            recon = self._raw_getitem(i)  # un-normalized reconstruction
+            pixel_values.append(recon.flatten())
+
+        all_pixels = torch.cat(pixel_values)
+        p99 = float(torch.quantile(all_pixels, 0.99))
+
+        if p99 < 1e-10:
+            warnings.warn(
+                "[BaseLimitedAngleReconstructions] 99th percentile is near zero "
+                f"({p99:.2e}). Using norm_scale=1.0.",
+                stacklevel=2,
+            )
+            return 1.0
+
+        norm_scale = 1.0 / p99
+
+        # ── Save to cache ─────────────────────────────────────────────────
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            with open(config_file, "w") as f:
+                json.dump({
+                    "norm_scale": norm_scale,
+                    "p99_value": p99,
+                    "n_calibration_samples": n_cal,
+                    "n_slices": self.n_slices,
+                    "k_angles": self.k_angles,
+                }, f, indent=2)
+            print(f"  Saved normalization config to {config_file}")
+        except OSError as e:
+            warnings.warn(
+                f"[BaseLimitedAngleReconstructions] Could not save normalization "
+                f"config to {config_file}: {e}",
+                stacklevel=2,
+            )
+
+        warnings.warn(
+            f"[BaseLimitedAngleReconstructions] Normalization calibrated: "
+            f"p99={p99:.6f}, norm_scale={norm_scale:.4f}. "
+            f"Reconstructions will be multiplied by {norm_scale:.4f} to map "
+            f"them to ~[0, 1].",
+            stacklevel=2,
+        )
+        return norm_scale
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
         return self._n_samples
 
     # ------------------------------------------------------------------
+    def _raw_getitem(self, idx: int) -> torch.Tensor:
+        """Return the un-normalized FBP reconstruction(s) for window *idx*.
+
+        Returns ``(ny, nx)`` when ``num_frames=1``, or
+        ``(num_frames, ny, nx)`` otherwise.
+        """
+        frames = []
+        for f in range(self._num_frames):
+            start = idx * self._gap + f * self.k_angles
+            w = slice(start, start + self._window_size)
+            sino = self.total_sino[w].to(self.device)           # (window_size, W)
+            angles = self.total_angles[w].cpu().numpy().astype(np.float64)  # (window_size,)
+
+            recon = fbp_reconstruction_masked(
+                projs_vrc=sino.unsqueeze(1),  # (window_size, 1, W)
+                angles_deg=angles,
+                vol_shape=(1, *self.vol_shape),
+                det_spacing_mm=self.det_spacing_mm,
+                lamino_angle_deg=0.0,
+                filter_type=self.filter_type,
+                device=self.device,
+            )  # (ny, nx) float32 tensor
+            frames.append(recon)
+
+        if self._num_frames == 1:
+            return frames[0]
+        return torch.stack(frames, dim=0)  # (num_frames, ny, nx)
+
+    # ------------------------------------------------------------------
     def __getitem__(self, idx: int) -> torch.Tensor:
-        """Return the FBP reconstruction for window position *idx*.
+        """Return the normalized FBP reconstruction for window position *idx*.
+
+        The reconstruction is multiplied by ``self.norm_scale`` so that values
+        are in ~[0, 1] range, suitable for diffusion model training.
 
         Parameters
         ----------
@@ -406,23 +578,13 @@ class BaseLimitedAngleReconstructions(Dataset):
 
         Returns
         -------
-        recon : (ny, nx) float32 tensor
-            2-D FBP reconstruction, optionally transformed.
+        recon : (ny, nx) or (num_frames, ny, nx) float32 tensor
+            Normalized FBP reconstruction(s), optionally transformed.
         """
+        recon = self._raw_getitem(idx)
 
-        w = slice(idx, idx + self._window_size)
-        sino = self.total_sino[w].to(self.device)           # (window_size, W)
-        angles = self.total_angles[w].cpu().numpy().astype(np.float64)  # (window_size,)
-
-        recon = fbp_reconstruction_masked(
-            projs_vrc=sino.unsqueeze(1),  # (window_size, 1, W)
-            angles_deg=angles,
-            vol_shape=(1, *self.vol_shape),
-            det_spacing_mm=self.det_spacing_mm,
-            lamino_angle_deg=0.0,
-            filter_type=self.filter_type,
-            device=self.device,
-        )  # (ny, nx) float32 tensor
+        # Apply normalization
+        recon = recon * self.norm_scale
 
         if self.transform is not None:
             recon = self.transform(recon)
@@ -432,9 +594,47 @@ class BaseLimitedAngleReconstructions(Dataset):
     # ------------------------------------------------------------------
     def get_window_center(self, idx: int) -> int:
         """Return the center position (row in total_sino) for window *idx*."""
-        return idx + self._window_size // 2
+        return idx * self._gap + self._window_size // 2
 
     def which_slice(self, idx: int) -> int:
         """Return the time-slice that contains the window center for *idx*."""
         center = self.get_window_center(idx)
         return center // self.k_angles
+
+    # ------------------------------------------------------------------
+    def get_multiframe_data(self, start_slice: int) -> dict:
+        """Return per-frame ground-truth and measurement data for inference.
+
+        Parameters
+        ----------
+        start_slice : int
+            Index of the first time-slice.  The method returns data for
+            ``num_frames`` consecutive slices: ``start_slice``,
+            ``start_slice + 1``, …, ``start_slice + num_frames - 1``.
+
+        Returns
+        -------
+        dict with keys
+            slice_indices : list[int]
+                Time-slice indices (length ``num_frames``).
+            full_sinograms : list[torch.Tensor]
+                Full sinogram per frame, each ``(total_projections, W)``.
+            limited_sinograms : list[torch.Tensor]
+                Limited-angle sinogram per frame, each ``(k_angles, W)``.
+            limited_angles_deg : list[np.ndarray]
+                Projection angles (degrees) per frame, each ``(k_angles,)``.
+            all_angles_deg : np.ndarray
+                Full angle array ``(total_projections,)``.
+        """
+        la = self.la_data
+        indices = list(range(start_slice, start_slice + self._num_frames))
+        assert all(0 <= t < self.n_slices for t in indices), (
+            f"Slice indices {indices} out of range [0, {self.n_slices})"
+        )
+        return {
+            "slice_indices": indices,
+            "full_sinograms": [la.full_sinograms[t] for t in indices],
+            "limited_sinograms": [la.limited_sinograms[t] for t in indices],
+            "limited_angles_deg": [la.slice_angles_deg[t] for t in indices],
+            "all_angles_deg": la.all_angles_deg,
+        }

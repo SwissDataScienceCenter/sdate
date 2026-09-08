@@ -36,6 +36,11 @@ def parse_args():
     p.add_argument("--start_window_offset", type=int, default=1)  # start from the 2nd (odd)
     p.add_argument("--dose", type=float, default=0.05)
     p.add_argument("--tag", default=None)
+    p.add_argument("--vmax_pctile", type=float, default=99.0,
+                   help="Movie display window upper percentile (of GT). Real datasets are densely "
+                        "textured so 99 works well; a sparse-object synthetic phantom needs something "
+                        "closer to 99.9 or objects saturate to white and background noise gets "
+                        "stretched to fill the frame.")
     return p.parse_args()
 
 
@@ -96,7 +101,7 @@ def main():
 
     mid = len(res["movie_rows"]) // 2
     gt = np.stack([f[mid].numpy() for f in res["movie"]["GT"]])
-    vmin, vmax = np.percentile(gt, [1, 99])
+    vmin, vmax = np.percentile(gt, [100 - a.vmax_pctile, a.vmax_pctile])
     combined = [torch.cat([res["movie"][arm][i][mid] for arm in res["arms"]], dim=1) for i in range(nW)]
     R.write_slice_movie(combined, OUT / f"recon_{tag}.mov", float(vmin), float(vmax))
     print("panels:", " | ".join(res["arms"]), flush=True)

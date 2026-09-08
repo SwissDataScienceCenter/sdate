@@ -1,0 +1,28 @@
+# # Additional requirements for HEIC to TIFF translation training
+
+# # Core ML/DL libraries
+# torch>=2.0.0
+# torchvision>=0.15.0
+# numpy>=1.21.0
+
+# # Diffusers for UNet3D model
+# diffusers>=0.24.0
+# transformers>=4.30.0
+
+# # Training utilities
+# accelerate>=0.24.0
+# wandb>=0.15.0
+
+# # Image processing
+# pillow>=9.0.0
+# pillow-heif>=0.13.0
+# tifffile>=2022.5.4
+
+# # Data loading and utilities
+# tqdm>=4.64.0
+# pyyaml>=6.0
+# zarr>=3.0.0
+
+# # Optional but recommended
+# scipy>=1.9.0
+# matplotlib>=3.5.0

@@ -272,10 +272,16 @@ def main():
                         help="Add gradient consistency loss")
     parser.add_argument("--gradient_weight", type=float, default=0.1,
                         help="Weight for gradient loss (default: 0.1)")
+    parser.add_argument("--use_proxy_rate", action='store_true',
+                        help="Add proxy rate term to encourage compressibility")
+    parser.add_argument("--lambda_rate", type=float, default=0.01,
+                        help="Weight for proxy rate loss (default: 0.01)")
+    parser.add_argument("--proxy_rate_epsilon", type=float, default=1e-4,
+                        help="Epsilon for numerical stability in proxy rate (default: 1e-4)")
     
     # Checkpoint arguments
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
-                        help="Directory to save checkpoints (default: checkpoints)")
+    parser.add_argument("--checkpoint_dir", type=str, default="/myhome/sdate/checkpoints",
+                        help="Directory to save checkpoints (default: /myhome/sdate/checkpoints)")
     parser.add_argument("--load_checkpoint", type=str, default="",
                         help="Path to checkpoint to resume from")
     parser.add_argument("--save_every", type=int, default=10,
@@ -379,7 +385,10 @@ def main():
         device=device,
         use_l1=args.use_l1,
         use_gradient_loss=args.use_gradient_loss,
-        gradient_weight=args.gradient_weight
+        gradient_weight=args.gradient_weight,
+        use_proxy_rate=args.use_proxy_rate,
+        lambda_rate=args.lambda_rate,
+        proxy_rate_epsilon=args.proxy_rate_epsilon
     )
     
     # Create checkpoint directory

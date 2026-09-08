@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, List, Iterable
@@ -79,7 +80,9 @@ class HevcGray10Streamer:
         self._shape: Optional[tuple[int, int]] = None  # (H, W)
         self._frame_count = 0
         self.segments: List[Path] = []
-        self._segment_open = False  
+        self._segment_open = False
+        self._stderr_tail = b""
+        self._stderr_thread: Optional[threading.Thread] = None
 
     # ------------- segment lifecycle -------------
     def start_segment(self, q: Optional[int] = None, outfile: Optional[str | os.PathLike] = None):
@@ -252,11 +255,6 @@ class HevcGray10Streamer:
         except BrokenPipeError as e:
             # If the hardware path breaks on the very first frame, fallback to software now
             if self._using_hardware and self._frame_count == 0:
-                try:
-                    if self._proc and self._proc.stderr:
-                        _ = self._proc.stderr.read()
-                except Exception:
-                    pass
                 if self._proc:
                     try:
                         self._proc.kill()
@@ -271,9 +269,9 @@ class HevcGray10Streamer:
                 self._frame_count += 1
                 return
             stderr = ""
-            if self._proc and self._proc.stderr:
+            if self._proc:
                 try:
-                    stderr = self._proc.stderr.read().decode(errors="ignore")
+                    stderr = self._stderr_tail.decode(errors="ignore")
                 except Exception:
                     pass
             raise RuntimeError(f"ffmpeg pipe closed unexpectedly after {self._frame_count} frames.\n{stderr}") from e
@@ -307,7 +305,37 @@ class HevcGray10Streamer:
                 self._using_hardware = False
             except FileNotFoundError:
                 raise RuntimeError("ffmpeg executable not found")
+        self._start_stderr_drain(proc)
         return proc
+
+    def _start_stderr_drain(self, proc: subprocess.Popen) -> None:
+        """Continuously drain ffmpeg's stderr in the background.
+
+        ffmpeg writes verbose per-frame progress to stderr by default. Nothing
+        else reads that pipe during normal append_frame() calls, so once ffmpeg
+        has written enough of it to fill the OS pipe buffer (64KB on Linux),
+        its next stderr write() blocks forever -- ffmpeg silently deadlocks
+        with 0% CPU, appearing to hang partway through an otherwise-working
+        encode (confirmed: this is exactly what happened after ~800 frames of
+        a slow veryslow-preset encode). Keep only a bounded tail for error
+        messages; the point is to keep the pipe drained, not to log everything.
+        """
+        self._stderr_tail = b""
+
+        def _drain():
+            try:
+                assert proc.stderr is not None
+                while True:
+                    chunk = proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    self._stderr_tail = (self._stderr_tail + chunk)[-65536:]
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+        self._stderr_thread = t
 
     # ------------- rotate / close -------------
     def close_segment(self) -> None:
@@ -326,13 +354,10 @@ class HevcGray10Streamer:
                 self._proc.stdin.close()
             except Exception:
                 pass
-        stderr = b""
-        if self._proc.stderr:
-            try:
-                stderr = self._proc.stderr.read()
-            except Exception:
-                pass
         ret = self._proc.wait()
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=5)
+        stderr = self._stderr_tail
         using_hw = self._using_hardware
         outfile = self._current_outfile
 

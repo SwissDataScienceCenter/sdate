@@ -16,6 +16,7 @@ directly as ``gray12le`` (HEVC) or ``gray16le`` (FFV1), no rescale filter.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -23,7 +24,10 @@ from pathlib import Path
 
 import numpy as np
 
-FFMPEG = "/myhome/tools/ffmpeg/bin/ffmpeg"
+# RunAI-sandbox-specific default; override via TR_FBP_CODEC_FFMPEG on
+# environments with a different filesystem layout (e.g. CSCS Clariden) --
+# see DEPENDENCIES.md "Portability".
+FFMPEG = os.environ.get("TR_FBP_CODEC_FFMPEG", "/myhome/tools/ffmpeg/bin/ffmpeg")
 
 
 def _run(cmd: list) -> None:

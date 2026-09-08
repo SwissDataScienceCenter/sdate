@@ -119,7 +119,11 @@ def render_projections(
         chord2 = (r_eff ** 2 - (u - u0) ** 2).clamp_min(0.0)  # (N, H, W)
         p = p + mu * 2.0 * torch.sqrt(chord2)
 
-    return p.to(torch.float32)
+    # mu is allowed to be negative (a "void"/lower-attenuation inclusion in a
+    # denser background, e.g. a gas bubble in a melt) -- physically the total
+    # line-integrated attenuation still can't go negative, so clamp the sum,
+    # not each capsule.
+    return p.clamp_min(0.0).to(torch.float32)
 
 
 def attenuation_to_counts(p: torch.Tensor, I0: float) -> torch.Tensor:
@@ -143,36 +147,95 @@ def _bump(t: np.ndarray, t0: float, t1: float, rise: float, fall: float) -> np.n
     return np.minimum(up, down).clip(0.0, 1.0)
 
 
+def _signed_mu(rng: np.random.Generator, lo: float, hi: float) -> float:
+    """A random attenuation contrast of magnitude in ``[lo, hi]``, either sign.
+
+    Positive = denser inclusion (grain/particle); negative = a void/bubble in
+    a denser surrounding medium. Excludes a dead zone near 0 so every capsule
+    stays visible.
+    """
+    return float(rng.choice([-1.0, 1.0]) * rng.uniform(lo, hi))
+
+
 def default_scene(
     frame_start: int = 0,
     frame_end: int = 100_000,
     height: int = 128,
     width: int = 512,
     seed: int = 0,
+    n_grains: int = 1800,
+    dynamic_fraction: float = 0.2,
+    n_large: int = 6,
+    n_mid: int = 30,
 ) -> List[Capsule]:
-    """A hand-tuned population of capsules for the synthetic time-resolved dataset.
+    """A densely-packed granular/foam phantom -- one uniform grain population.
 
-    Every capsule's radial extent from the z-axis, ``sqrt(cx(t)**2+cy(t)**2) +
-    radius(t)``, is kept ``<= width/2 - 20`` for ALL ``t`` -- staying within the
-    detector footprint at every rotation angle. This matters specifically for
-    parallel-beam geometry: an object that drifts outside this radius does not
-    just leave the frame, it periodically flickers back into view once per
-    rotation (whenever the rotation angle happens to align it back within the
-    finite detector width), which would look like a spurious per-turn artifact
-    rather than a real trajectory.
+    Earlier versions used a sparse population of "moving objects" (10-25px,
+    later 5-11px) against an empty or near-empty background. That design could
+    never reproduce the dramatic "unusable noisy recon -> perfect denoised"
+    story real datasets show: reconstruction noise for a feature shrinks with
+    its size, so ANY larger feature (a single bigger object, or just a chance
+    cluster of a few same-sign objects overlapping) survives the noise as a
+    visible anchor, and a viewer/model can track the scene through that alone.
+    Real materials (foams, slurries, granular media) don't offer such an
+    anchor: they're a densely-packed, irregular texture with no standout
+    simple shape, so noise degrades everything roughly together.
 
-    Two kinds of activity, both timed to change visibly rotation-to-rotation but
-    stay ~constant within any single rotation (``period_360`` = 180 frames at
-    ``deg_per_frame=2.0``):
-    - persistent capsules that drift (bounded radial oscillation) and pulse in
-      size slowly over thousands of frames;
-    - transient capsules that nucleate, grow, and dissolve over a
-      few-hundred-to-few-thousand-frame window via :func:`_bump`, staggered
-      across the whole sequence so there is always something changing.
-    Two pairs of capsules follow bounded (tanh-saturating, never unbounded)
-    crossing trajectories so they visibly pass through the same region
-    mid-sequence -- an "encounter" that reads as a merge/split, for free from
-    linear superposition of the Radon transform, no special-case topology code.
+    This scene reproduces that instead: ``n_grains`` capsules with a
+    *narrow, bounded* size range (radius/z_half both 4-12px, no large
+    outliers), placed densely enough to fill most of the field of view
+    (~90%+ areal coverage, grains touching/overlapping like a real granular
+    cross-section) with alternating-sign attenuation contrast (denser grains
+    and voids/bubbles both occur). There is no separate large "background"
+    capsule (its own moiré artifact isn't worth it once grains already fill
+    the frame) and no special "texture" tier -- the grains ARE the texture.
+
+    Most grains (``1 - dynamic_fraction``) are static -- a real jammed
+    granular pack mostly doesn't move except at localized rearrangement
+    events. The remaining ``dynamic_fraction`` nucleate/grow/dissolve via
+    :func:`_bump` (staggered lifecycles across the whole sequence, same
+    few-hundred-to-few-thousand-frame timescale as before) with a small
+    bounded drift on top -- but critically, their radius never exceeds the
+    SAME 4-12px bound as the static grains, so a dynamic grain never becomes
+    a size/contrast outlier relative to its neighbours.
+
+    Every grain's radial extent from the z-axis, ``sqrt(cx(t)**2+cy(t)**2) +
+    radius(t)``, is kept ``<= width/2 - 20`` for ALL ``t`` (see the discussion
+    in earlier versions of this docstring in project memory for why this
+    matters for parallel-beam geometry specifically).
+
+    On top of the grain pack, two more tiers give the scene its main driving
+    dynamics -- a breathing ("5x bigger and back") tier was tried and didn't
+    read as real motion; this replaces it with genuine size diversity plus
+    genuine large-scale translation instead:
+
+    * ``n_large`` "large" objects, roughly 6-10x a grain's radius (45-80px vs
+      grains' 4-12px), mixed in among the grains at fixed (static) positions
+      and sizes -- a real granular/foam cross-section often has a few much
+      bigger inclusions sitting among the fine texture, not just uniform
+      grains. Best-of-many placement (see below) so they read as several
+      distinct big features rather than fusing into one blob. Contrast
+      (0.015-0.025), close to a grain's own (0.025-0.05).
+    * ``n_mid`` "mid" objects, 3-6x a grain's radius (20-45px), each sweeping
+      back and forth through a substantial fraction of the field of view
+      (50-110px amplitude) over a *slow* period (6000-15000 frames) -- this is
+      the scene's clearly-visible moving population, distinct from the
+      grains' deliberately subtle in-place jitter. Contrast (0.018-0.028).
+
+    All three tiers' contrast floors were raised together (grains
+    0.02->0.025, large 0.010->0.015, mid 0.012->0.018) after an early pass
+    reconstructed with a wide 0-to-peak intensity spread -- a lot of
+    individual objects sat close to 0 (near-invisible) with only rare
+    same-sign overlap clusters reaching the top of the range. Narrowing each
+    tier's own floor-to-ceiling ratio, combined with a less extreme display
+    percentile (``vmax_pctile=99`` instead of ``99.9`` -- the ``.9`` was
+    itself stretching the scale to accommodate rare overlap brightness
+    spikes), puts most individual objects' reconstructed peak at roughly
+    30-100% of the display ceiling instead of 0-100%.
+
+    Both tiers are a handful of objects on top of ~1800 grains, not the
+    primary population, so the fine-grain noise-defeat property (see above)
+    is untouched.
     """
     rng = np.random.default_rng(seed)
     r_lim = width / 2.0 - 20.0
@@ -180,72 +243,111 @@ def default_scene(
     span = float(frame_end - frame_start)
     caps: List[Capsule] = []
 
-    # -- persistent, radially-bounded drifting/pulsing capsules --------------
-    n_persist = 10
-    for i in range(n_persist):
-        orbit_r = rng.uniform(20.0, 175.0)
-        osc_amp = rng.uniform(5.0, 12.0)
-        base_ang = rng.uniform(0.0, 2 * np.pi)
-        period = rng.uniform(3000.0, 15000.0)
-        phase = rng.uniform(0.0, 2 * np.pi)
-        radius0 = rng.uniform(12.0, 22.0)
-        rpulse = rng.uniform(0.1, 0.2) * radius0
-        rperiod = rng.uniform(2000.0, 8000.0)
-        cz0 = rng.uniform(-z_lim, z_lim)
-        z_half0 = rng.uniform(10.0, 22.0)
-        mu0 = rng.uniform(0.03, 0.09)
-        shape = "flat" if i < 3 else "round"
+    n_dynamic = int(round(n_grains * dynamic_fraction))
+    dynamic_idx = set(rng.choice(n_grains, size=n_dynamic, replace=False).tolist())
+    orbit_max = r_lim - 22.0  # leaves room for drift amp (<=8) + max radius (12) + margin
 
-        def cx(t, orbit_r=orbit_r, osc_amp=osc_amp, base_ang=base_ang, period=period, phase=phase):
-            return (orbit_r + osc_amp * np.sin(2 * np.pi * t / period + phase)) * np.cos(base_ang)
-
-        def cy(t, orbit_r=orbit_r, osc_amp=osc_amp, base_ang=base_ang, period=period, phase=phase):
-            return (orbit_r + osc_amp * np.sin(2 * np.pi * t / period + phase)) * np.sin(base_ang)
-
-        def radius(t, radius0=radius0, rpulse=rpulse, rperiod=rperiod, phase=phase):
-            return radius0 + rpulse * np.sin(2 * np.pi * t / rperiod + phase)
-
-        caps.append(Capsule(cx, cy, const(cz0), radius, const(z_half0), const(mu0),
-                            shape=shape, name=f"persist{i}"))
-
-    # -- two bounded crossing pairs ("encounter" events) ---------------------
-    for j in range(2):
-        cz0 = rng.uniform(-z_lim, z_lim)
-        y0 = rng.uniform(-40.0, 40.0)
-        t_cross = frame_start + span * rng.uniform(0.25, 0.75)
-        width_frames = rng.uniform(3000.0, 8000.0)
-        amp = rng.uniform(60.0, min(150.0, np.sqrt(max(r_lim ** 2 - y0 ** 2, 0.0)) - 25.0))
-        radius0 = rng.uniform(14.0, 20.0)
-        z_half0 = rng.uniform(14.0, 20.0)
-        mu0 = rng.uniform(0.05, 0.08)
-        for sign in (+1.0, -1.0):
-            def cx(t, sign=sign, amp=amp, t_cross=t_cross, width_frames=width_frames):
-                return sign * amp * np.tanh((t - t_cross) / width_frames)
-
-            caps.append(Capsule(cx, const(y0), const(cz0), const(radius0), const(z_half0), const(mu0),
-                                shape="round", name=f"cross{j}_{int(sign)}"))
-
-    # -- transient nucleation/dissolution events, staggered across the sequence
-    n_events = 24
-    for k in range(n_events):
-        t0 = frame_start + span * rng.uniform(0.0, 0.95)
-        life = rng.uniform(800.0, 3000.0)
-        rise = life * rng.uniform(0.2, 0.35)
-        fall = life * rng.uniform(0.2, 0.35)
-        t1 = t0 + life
-        orbit = rng.uniform(0.0, r_lim - 30.0)
+    for i in range(n_grains):
+        orbit = rng.uniform(0.0, orbit_max)
         ang = rng.uniform(0.0, 2 * np.pi)
         cx0, cy0 = orbit * np.cos(ang), orbit * np.sin(ang)
         cz0 = rng.uniform(-z_lim, z_lim)
-        radius0 = rng.uniform(10.0, 22.0)
-        z_half0 = rng.uniform(8.0, 20.0)
-        mu0 = rng.uniform(0.04, 0.10)
-        shape = "flat" if k % 4 == 0 else "round"
+        radius0 = rng.uniform(4.0, 12.0)
+        z_half0 = rng.uniform(4.0, 12.0)
+        mu0 = _signed_mu(rng, 0.025, 0.05)
+        shape = "flat" if rng.random() < 0.25 else "round"
 
-        def radius(t, radius0=radius0, t0=t0, t1=t1, rise=rise, fall=fall):
-            return radius0 * _bump(t, t0, t1, rise, fall)
+        if i in dynamic_idx:
+            t0 = frame_start + span * rng.uniform(0.0, 0.95)
+            life = rng.uniform(800.0, 3000.0)
+            rise = life * rng.uniform(0.2, 0.35)
+            fall = life * rng.uniform(0.2, 0.35)
+            t1 = t0 + life
+            amp = rng.uniform(3.0, 8.0)
+            period = rng.uniform(2000.0, 8000.0)
+            phase = rng.uniform(0.0, 2 * np.pi)
+            drift_ang = rng.uniform(0.0, 2 * np.pi)
 
-        caps.append(Capsule(const(cx0), const(cy0), const(cz0), radius, const(z_half0), const(mu0),
-                            shape=shape, name=f"event{k}"))
+            def radius(t, radius0=radius0, t0=t0, t1=t1, rise=rise, fall=fall):
+                return radius0 * _bump(t, t0, t1, rise, fall)
+
+            def cx(t, cx0=cx0, amp=amp, period=period, phase=phase, drift_ang=drift_ang):
+                return cx0 + amp * np.cos(drift_ang) * np.sin(2 * np.pi * t / period + phase)
+
+            def cy(t, cy0=cy0, amp=amp, period=period, phase=phase, drift_ang=drift_ang):
+                return cy0 + amp * np.sin(drift_ang) * np.sin(2 * np.pi * t / period + phase)
+
+            caps.append(Capsule(cx, cy, const(cz0), radius, const(z_half0), const(mu0),
+                                shape=shape, name=f"grain{i}_dyn"))
+        else:
+            caps.append(Capsule(const(cx0), const(cy0), const(cz0), const(radius0), const(z_half0),
+                                const(mu0), shape=shape, name=f"grain{i}_static"))
+
+    # -- "large" objects: static size diversity, ~10x a grain's radius ------
+    # Best-of-many placement (maximise the minimum separation margin to
+    # already-placed large objects, out of many random candidates) so they
+    # read as several distinct big features against the grain pack -- plain
+    # uniform placement, and even a fixed-threshold rejection sampler, in the
+    # (necessarily tight, given their own size) orbit range mostly put them
+    # on top of each other, fusing into one big blob rather than "large
+    # objects mixed with the small ones".
+    large_radius_max, large_margin = 80.0, 10.0
+    large_orbit_max = max(r_lim - (large_radius_max + large_margin), 0.0)
+    placed: List[tuple] = []  # (cx0, cy0, radius0)
+    for k in range(n_large):
+        radius0 = rng.uniform(45.0, large_radius_max)
+        z_half0 = radius0 * rng.uniform(0.8, 1.2)
+        best_xy, best_margin = None, -np.inf
+        for _candidate in range(500):
+            # Uniform in AREA (not radius) -- uniform-radius sampling piles
+            # candidates up near the centre (equal weight per radius bin, but
+            # the centre bins cover far less area), starving the packing.
+            orbit = large_orbit_max * np.sqrt(rng.uniform(0.0, 1.0))
+            ang = rng.uniform(0.0, 2 * np.pi)
+            cx0, cy0 = orbit * np.cos(ang), orbit * np.sin(ang)
+            margin = (np.inf if not placed else
+                     min(np.hypot(cx0 - px, cy0 - py) - (radius0 + pr) for px, py, pr in placed))
+            if margin > best_margin:
+                best_xy, best_margin = (cx0, cy0), margin
+        cx0, cy0 = best_xy
+        placed.append((cx0, cy0, radius0))
+        cz0 = rng.uniform(-z_lim, z_lim)
+        mu0 = _signed_mu(rng, 0.015, 0.025)
+        shape = "flat" if rng.random() < 0.3 else "round"
+        caps.append(Capsule(const(cx0), const(cy0), const(cz0), const(radius0), const(z_half0),
+                            const(mu0), shape=shape, name=f"large{k}"))
+
+    # -- "mid" objects: the scene's main driving dynamics --------------------
+    # Sweep back and forth through a substantial fraction of the FOV over a
+    # slow period -- distinct from the grains' subtle in-place jitter. FOV
+    # bound must cover the worst case (base offset + sweep amplitude both at
+    # their max) even though random phases make that combination rare.
+    mid_radius_max, mid_amp_max, mid_margin = 45.0, 110.0, 10.0
+    mid_orbit_max = max(r_lim - (mid_radius_max + mid_amp_max + mid_margin), 0.0)
+    for k in range(n_mid):
+        radius0 = rng.uniform(20.0, mid_radius_max)
+        z_half0 = radius0 * rng.uniform(0.8, 1.2)
+        orbit = rng.uniform(0.0, mid_orbit_max)
+        ang = rng.uniform(0.0, 2 * np.pi)
+        cx0, cy0 = orbit * np.cos(ang), orbit * np.sin(ang)
+        cz0 = rng.uniform(-z_lim, z_lim)
+        mu0 = _signed_mu(rng, 0.018, 0.028)
+        shape = "flat" if rng.random() < 0.25 else "round"
+
+        drift_amp = rng.uniform(50.0, mid_amp_max)
+        drift_period = rng.uniform(6000.0, 15000.0)  # slow
+        drift_phase = rng.uniform(0.0, 2 * np.pi)
+        drift_ang = rng.uniform(0.0, 2 * np.pi)
+
+        def cx(t, cx0=cx0, drift_amp=drift_amp, drift_period=drift_period,
+              drift_phase=drift_phase, drift_ang=drift_ang):
+            return cx0 + drift_amp * np.cos(drift_ang) * np.sin(2 * np.pi * t / drift_period + drift_phase)
+
+        def cy(t, cy0=cy0, drift_amp=drift_amp, drift_period=drift_period,
+              drift_phase=drift_phase, drift_ang=drift_ang):
+            return cy0 + drift_amp * np.sin(drift_ang) * np.sin(2 * np.pi * t / drift_period + drift_phase)
+
+        caps.append(Capsule(cx, cy, const(cz0), const(radius0), const(z_half0), const(mu0),
+                            shape=shape, name=f"mid{k}"))
 
     return caps

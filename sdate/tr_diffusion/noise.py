@@ -93,6 +93,54 @@ def binomial_complementary_split(counts: torch.Tensor, p: float = 0.5,
     return N1 / p, N2 / (1.0 - p)
 
 
+def anscombe_transform(counts: torch.Tensor) -> torch.Tensor:
+    """Variance-stabilising transform for Poisson counts: ``z = 2*sqrt(counts + 3/8)``.
+
+    For ``X ~ Poisson(lambda)``, ``Var[2*sqrt(X+3/8)] ~= 1`` for every ``lambda``
+    (the ``3/8`` offset is chosen specifically to kill the leading bias term) --
+    i.e. the transformed signal has an approximately GLOBAL, CONSTANT noise
+    variance regardless of the local count rate, turning a heteroscedastic Poisson
+    problem into the homoscedastic-Gaussian setting "Consistent Diffusion Meets
+    Tweedie" (arXiv:2404.10177) actually assumes -- see :mod:`sdate.tr_diffusion.ambient_tweedie`.
+    Approximation quality degrades at very low counts (needs roughly lambda > ~4-8
+    for the unit-variance approximation to be good); this project's dose-thinned
+    measurements run in the hundreds of counts, comfortably inside that regime.
+    """
+    return 2.0 * torch.sqrt(counts.clamp_min(0.0) + 0.375)
+
+
+def anscombe_transform_thinned(dose_corrected: torch.Tensor, dose: float) -> torch.Tensor:
+    """Anscombe transform of a dose-corrected measurement from :func:`add_poisson_noise`.
+
+    ``add_poisson_noise`` returns ``N / dose`` where ``N ~ Poisson(counts * dose)`` is the
+    actual raw photon draw. That rescaled quantity has variance ``counts / dose``, NOT
+    ``counts`` like a true Poisson count -- so calling :func:`anscombe_transform` directly
+    on it does NOT have the unit-variance property (confirmed empirically: for
+    ``counts=400, dose=0.05``, ``Var[anscombe_transform(dose_corrected)] ~= 20.4 ~= 1/dose``,
+    not ``~=1``). This recovers the raw draw (``dose_corrected * dose``) before
+    transforming, so the standard unit-variance guarantee actually holds (confirmed
+    empirically: ``Var[anscombe_transform_thinned(dose_corrected, dose)] ~= 1.0``).
+    """
+    return anscombe_transform(dose_corrected * dose)
+
+
+def inverse_anscombe(z: torch.Tensor) -> torch.Tensor:
+    """Algebraic inverse of :func:`anscombe_transform`: ``(z/2)^2 - 3/8``.
+
+    A "closed-form asymptotically-unbiased" correction exists in the literature
+    (Makitalo & Foi, 2011) for the very-low-count regime; a from-memory attempt at
+    reproducing its coefficients here was checked against a Monte Carlo bias
+    simulation (Poisson draws at lambda in [1, 1000], forward+inverse, compare the
+    mean recovered value to the true lambda) and came back with a clear, persistent
+    bias (~+0.25 too high) -- i.e. the remembered formula was wrong, not the
+    concept. Rather than ship an uncertain, unverifiable correction, this plain
+    inverse is used instead: the SAME Monte Carlo check shows it is already
+    essentially unbiased (within simulation noise) across that whole range,
+    including lambda=1, so the low-count correction isn't needed for this
+    project's count levels (hundreds, from the dose-0.05 measurement)."""
+    return (z / 2.0) ** 2 - 0.375
+
+
 def binomial_thin(counts: torch.Tensor, q: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
     """Further thin an ALREADY-REALISED measurement by fraction ``q`` (inference-time).
 

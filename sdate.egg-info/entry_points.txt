@@ -1,0 +1,2 @@
+[console_scripts]
+chip-eval-al = chip.evaluation.active_learning:main

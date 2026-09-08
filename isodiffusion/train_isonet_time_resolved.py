@@ -157,7 +157,7 @@ class IsoNetLoss(BaseLoss):
         start_angle_deg: float = 0.0,
         tilt_axis: int = 0,
     ) -> None:
-        metrics = ["loss", "f_loss_magnitude", "f_loss_mse", "real_space_loss"] if fourier_loss_weight > 0 else ["loss"]
+        metrics = ["loss", "f_loss_magnitude", "f_loss_mse", "real_space_loss"] if fourier_loss_weight > 0 else ["loss", "real_space_loss"]
         super().__init__(metrics)
         self.device = device
         self.cross_attention_dim = int(cross_attention_dim)

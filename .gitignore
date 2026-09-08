@@ -16,3 +16,16 @@ wandb/*
 *.csv
 *.err
 *.out
+samples/*.png
+outputs/*.npy
+.vscode-server/*
+.vscode-server
+isodiffusion/wandb/*
+
+*.ckpt
+*.0
+*.png
+*.mp4
+*.bak
+*.gif
+*.npy

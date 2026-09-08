@@ -1,0 +1,5 @@
+# Use a binomial split, not independent Poisson draws, for y1/y2
+
+The Annealed-N2N design originally called for `y1` and `y2` to be two genuinely independent Poisson(dose=0.05) draws from the reference frame. We instead generate them via `binomial_split(reference, dose=0.1, p=0.5)` — one shared Poisson(dose=0.1) draw, split 50/50 — reusing the exact mechanism and convention the existing N2N baseline already uses in this codebase.
+
+This makes `y1`/`y2` only *conditionally* independent given the shared total count, not independent measurements of the underlying signal, which is a real (if usually small) deviation from the textbook Noise2Noise assumption. We accepted it because it lets the pipeline reuse tested, already-calibrated dataset code and dose conventions rather than adding a second, subtly different noise-injection path. If results look off in a way that traces back to this conditional-independence gap, revisit by switching to two independent `add_poisson_noise` calls off the reference (the mechanism `BootstrapPoissonLoss` already uses elsewhere in this codebase).

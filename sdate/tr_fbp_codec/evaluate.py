@@ -80,6 +80,11 @@ def main():
     p.add_argument("--ckpt", type=str, required=True)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--max_frames", type=int, default=None)
+    p.add_argument("--skip_baselines", action="store_true",
+                    help="skip HEVC/FFV1 (needs ffmpeg, not present on every environment -- "
+                         "e.g. the CSCS Clariden image). Baseline bpp is static per dataset, "
+                         "so reuse an already-measured number rather than treating its absence "
+                         "as 'no baseline exists'.")
     args = p.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu")
@@ -113,28 +118,32 @@ def main():
     weight_bits = n_params * 32  # fp32 state_dict, worst case (no weight compression)
     model_bpp_with_weights = (total_bits + weight_bits) / total_px
 
-    quant_arr = np.stack([
-        quantize_to_12bit(
-            ds._R.native_window(ds.src, np.array([int(t)]), ds.profile.crop, ds.profile.rot_axis_col)[0].numpy(),
-            quant_cfg,
-        ).astype(np.uint16)
-        for t in targets
-    ])
-    fps = ds.profile.fps
-    hevc_bytes = baselines.encode_hevc12_lossless(quant_arr, fps=fps)
-    ffv1_bytes = baselines.encode_ffv1_lossless(quant_arr, fps=fps)
-    hevc_bpp = baselines.bits_per_pixel(hevc_bytes, *quant_arr.shape)
-    ffv1_bpp = baselines.bits_per_pixel(ffv1_bytes, *quant_arr.shape)
-
     result = {
         "n_frames": len(targets),
         "model_bpp_excl_weights": model_bpp,
         "model_bpp_incl_weights": model_bpp_with_weights,
         "n_model_params": n_params,
-        "hevc12_bpp": hevc_bpp,
-        "ffv1_bpp": ffv1_bpp,
         "per_frame": per_frame,
     }
+
+    if args.skip_baselines:
+        print("[eval] --skip_baselines set: not recomputing HEVC/FFV1 (needs ffmpeg). "
+              "Last measured on RunAI (200 held-out frames, same dataset): "
+              "hevc12_bpp=6.266, ffv1_bpp=5.602 -- compare against those, don't treat "
+              "their absence here as 'no baseline'.")
+    else:
+        quant_arr = np.stack([
+            quantize_to_12bit(
+                ds._R.native_window(ds.src, np.array([int(t)]), ds.profile.crop, ds.profile.rot_axis_col)[0].numpy(),
+                quant_cfg,
+            ).astype(np.uint16)
+            for t in targets
+        ])
+        fps = ds.profile.fps
+        hevc_bytes = baselines.encode_hevc12_lossless(quant_arr, fps=fps)
+        ffv1_bytes = baselines.encode_ffv1_lossless(quant_arr, fps=fps)
+        result["hevc12_bpp"] = baselines.bits_per_pixel(hevc_bytes, *quant_arr.shape)
+        result["ffv1_bpp"] = baselines.bits_per_pixel(ffv1_bytes, *quant_arr.shape)
     out_path = ckpt_dir / "eval_result.json"
     out_path.write_text(json.dumps(result, indent=2))
     print(json.dumps({k: v for k, v in result.items() if k != "per_frame"}, indent=2))

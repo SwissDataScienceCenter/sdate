@@ -47,13 +47,19 @@ class DataConfig:
     prototyping needs zero new GPU/ASTRA reconstruction compute -- picking a
     range outside [412800, 467200) means building a fresh cache first (a
     real RunAI/GPU job, not a config change).
+
+    Widened 2026-09-08 (from a 2000-frame slice to ~48000) to use nearly
+    all of the cached range once real (CSCS/multi-GPU) compute made the
+    original slice's overfitting risk worth addressing -- still zero new
+    reconstruction compute, this data was already sitting in the cache
+    unused.
     """
 
     profile_name: str = "wunderkerze2"
     frame_start: int = 413_000
-    frame_end: int = 415_000
-    holdout_frame_start: Optional[int] = 414_800  # last 200 frames held out
-    holdout_frame_end: Optional[int] = 415_000
+    frame_end: int = 461_000
+    holdout_frame_start: Optional[int] = 461_000  # last 4000 (of 54400 cached) frames held out
+    holdout_frame_end: Optional[int] = 465_000
 
 
 @dataclass

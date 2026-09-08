@@ -1,0 +1,7 @@
+torch
+numpy
+Pillow
+torch_dct
+huffman
+tqdm
+diffusers

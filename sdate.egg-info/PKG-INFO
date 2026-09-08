@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: sdate
+Version: 0.0.1
+Summary: Anomaly detection for Time resolved Computed Tomography
+Author: Luis Barba
+Author-email: <youremail@email.com>
+Requires-Dist: torch
+Requires-Dist: numpy
+Requires-Dist: Pillow
+Requires-Dist: torch_dct
+Requires-Dist: huffman
+Requires-Dist: tqdm
+Requires-Dist: diffusers
+Dynamic: author
+Dynamic: author-email
+Dynamic: requires-dist
+Dynamic: summary
