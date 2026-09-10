@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from dataclasses import asdict
@@ -32,6 +33,27 @@ from .config import CodecConfig, DataConfig, QuantConfig
 from .data import TrFbpCodecDataset, collate
 from .losses import ce_loss, nats_to_bits
 from .model import FramePredictorResNet3D, ModelConfig, stack_inputs
+
+
+def warmup_cosine_lr_lambda(warmup_steps: int, max_steps: int):
+    """Linear warmup to peak lr, then cosine decay to 0 over the remaining steps.
+
+    Plain constant-lr Adam plateaued within ~2000 steps and never improved
+    over the remaining ~58000 (see run history 2026-09-09/10 on Clariden) --
+    warmup avoids early instability at the larger DDP global batch size,
+    cosine decay lets the tail of a short run actually settle instead of
+    oscillating at a fixed step size.
+    """
+    warmup_steps = max(1, warmup_steps)
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+        progress = min(progress, 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return lr_lambda
 
 
 def setup_distributed(device_arg: str):
@@ -84,7 +106,11 @@ def main():
     p.add_argument("--block_size", type=int, default=None)
     p.add_argument("--base_channels", type=int, default=32)
     p.add_argument("--n_blocks", type=int, default=6)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=3e-4, help="peak LR (after warmup)")
+    p.add_argument(
+        "--warmup_steps", type=int, default=None,
+        help="LR linear-warmup steps; default 5%% of max_steps",
+    )
     p.add_argument("--batch_size", type=int, default=32, help="PER-GPU batch size")
     p.add_argument("--max_steps", type=int, default=5000)
     p.add_argument("--log_every", type=int, default=50)
@@ -135,6 +161,10 @@ def main():
     if is_ddp:
         model = DDP(model, device_ids=[local_rank])
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    warmup_steps = args.warmup_steps if args.warmup_steps is not None else max(1, int(0.05 * args.max_steps))
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lr_lambda=warmup_cosine_lr_lambda(warmup_steps, args.max_steps)
+    )
 
     ckpt_dir = Path(args.ckpt_dir)
     if is_main:
@@ -142,7 +172,7 @@ def main():
         (ckpt_dir / "config.json").write_text(json.dumps({
             "data_cfg": asdict(data_cfg), "codec_cfg": asdict(codec_cfg),
             "quant_cfg": asdict(quant_cfg), "model_cfg": asdict(model_cfg),
-            "args": vars(args), "world_size": world_size,
+            "args": vars(args), "world_size": world_size, "warmup_steps": warmup_steps,
         }, indent=2))
         print(f"[train] device={device} world_size={world_size} depth_in={depth_in} "
               f"train_targets={len(train_ds.targets)} "
@@ -178,12 +208,14 @@ def main():
             opt.zero_grad()
             loss.backward()
             opt.step()
+            sched.step()
 
             if is_main and step % args.log_every == 0:
                 elapsed = time.time() - t0
+                cur_lr = sched.get_last_lr()[0]
                 print(f"[train] step={step} loss_bits={nats_to_bits(loss).item():.4f} "
-                      f"elapsed={elapsed:.1f}s")
-                history.append({"step": step, "train_bpp": nats_to_bits(loss).item()})
+                      f"lr={cur_lr:.6g} elapsed={elapsed:.1f}s")
+                history.append({"step": step, "train_bpp": nats_to_bits(loss).item(), "lr": cur_lr})
 
             if holdout_loader is not None and step % args.eval_every == 0 and step > 0:
                 ho_bpp = eval_holdout_bpp(raw_model(), holdout_loader, codec_cfg, device)
