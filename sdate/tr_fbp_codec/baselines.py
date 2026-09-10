@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Sequence, Tuple
 
 import numpy as np
 
@@ -146,6 +147,72 @@ def temporal_diff_to_frames(diffs: np.ndarray) -> np.ndarray:
 def encode_ffv1_lossless_diff(frames: np.ndarray, fps: float = 30.0) -> bytes:
     """FFV1 applied to the temporal-diff stream instead of raw frames."""
     return encode_ffv1_lossless(frames_to_temporal_diff(frames), fps=fps, max_val=2 * _DIFF_BIAS)
+
+
+def frames_to_boxavg3(frames: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(T, H, W) uint16 in [0, 4095] -> (avg_stream, rem_stream), both same shape.
+
+    Frames 0, 1 pass through unchanged (no 3-frame window yet -- they seed
+    the recurrence). For i >= 2: ``S_i = P_i + P_{i-1} + P_{i-2}`` (integer,
+    range [0, 12285]), split via floor-div/mod into ``avg[i] = S_i // 3``
+    (range [0, 4095] -- SAME range as a raw frame, and its noise variance is
+    ~1/3rd of a single frame's since it's a genuine 3-frame average, not a
+    diff: the shared slowly-varying signal is kept, only independent noise
+    gets averaged down) and ``rem[i] = S_i % 3`` (in {0,1,2}, a cheap side
+    channel needed only for exact reconstruction -- ``S_i = 3*avg[i] +
+    rem[i]`` identically, by the floor/mod identity, no rounding loss).
+    ``rem[0], rem[1]`` are unused (always 0).
+
+    Exactly invertible by :func:`boxavg3_to_frames`.
+    """
+    frames_i32 = frames.astype(np.int32)
+    avg = frames_i32.copy()
+    rem = np.zeros_like(frames_i32)
+    if frames.shape[0] > 2:
+        s = frames_i32[2:] + frames_i32[1:-1] + frames_i32[:-2]
+        avg[2:] = s // 3
+        rem[2:] = s % 3
+    return avg.astype(np.uint16), rem.astype(np.uint16)
+
+
+def boxavg3_to_frames(avg: np.ndarray, rem: np.ndarray) -> np.ndarray:
+    """Exact inverse of :func:`frames_to_boxavg3`.
+
+    Sequential by construction (each recovered ``P_i`` needs the two
+    previously-recovered frames), so this is a plain Python loop -- fine
+    for offline verification, not meant as a fast decoder.
+    """
+    t = avg.shape[0]
+    frames = avg.astype(np.int32).copy()  # frames[0], frames[1] already exact
+    for i in range(2, t):
+        s_i = 3 * avg[i].astype(np.int32) + rem[i].astype(np.int32)
+        frames[i] = s_i - frames[i - 1] - frames[i - 2]
+    return frames.astype(np.uint16)
+
+
+def encode_ffv1_lossless_boxavg3(frames: np.ndarray, fps: float = 30.0) -> Tuple[bytes, bytes]:
+    """FFV1 on the box-average-3 reparametrization: (avg_bytes, rem_bytes).
+
+    Both streams must be kept (and their sizes both counted) to reconstruct
+    losslessly -- see :func:`bits_per_pixel_combined`.
+    """
+    avg, rem = frames_to_boxavg3(frames)
+    avg_bytes = encode_ffv1_lossless(avg, fps=fps, max_val=4095)
+    rem_bytes = encode_ffv1_lossless(rem, fps=fps, max_val=2)
+    return avg_bytes, rem_bytes
+
+
+def decode_ffv1_lossless_boxavg3(avg_bytes: bytes, rem_bytes: bytes, h: int, w: int) -> np.ndarray:
+    """Inverse of :func:`encode_ffv1_lossless_boxavg3` -- returns raw frames."""
+    avg = decode_ffv1_lossless(avg_bytes, h, w)
+    rem = decode_ffv1_lossless(rem_bytes, h, w)
+    return boxavg3_to_frames(avg, rem)
+
+
+def bits_per_pixel_combined(streams: Sequence[bytes], n_frames: int, h: int, w: int) -> float:
+    """Like :func:`bits_per_pixel` but for a codec split across multiple
+    byte streams that must ALL be kept to decode (e.g. boxavg3's avg+rem)."""
+    return sum(len(s) for s in streams) * 8 / (n_frames * h * w)
 
 
 def decode_ffv1_lossless_diff(encoded: bytes, h: int, w: int) -> np.ndarray:

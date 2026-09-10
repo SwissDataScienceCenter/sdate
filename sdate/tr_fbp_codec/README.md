@@ -183,6 +183,50 @@ so it's a genuinely different frame range, not a methodology
 discrepancy -- both measurements above used identical code and are
 internally consistent with each other.)
 
+### Follow-up: 3-frame box-average instead of a 2-frame diff (2026-09-10)
+
+A diff cancels the shared signal and doubles noise variance (above). The
+natural fix: average instead of subtract -- `P_1, P_2, (P_1+P_2+P_3)/3,
+(P_2+P_3+P_4)/3, ...` keeps the (slowly-varying) shared signal and reduces
+independent per-frame noise variance by ~3x. For exact losslessness you
+can't just round-divide by 3 and discard the remainder, so
+`frames_to_boxavg3`/`boxavg3_to_frames` split the integer 3-frame sum via
+floor-div/mod: `avg[i] = S_i // 3` (range [0,4095], same as a raw frame)
+and `rem[i] = S_i % 3` (in {0,1,2}), with `S_i = 3*avg[i] + rem[i]`
+identically (no rounding loss) -- `boxavg3_to_frames` recovers each `P_i`
+exactly from `avg`, `rem`, and the two previously-recovered frames.
+
+| | bpp (200 frames) | bpp (4000 frames) |
+|---|---|---|
+| FFV1 on raw frames | 5.892 | 5.900 |
+| FFV1 on box-avg3, avg channel ONLY | 5.404 | 5.406 |
+| FFV1 on box-avg3, remainder channel ONLY | 2.206 | 2.227 |
+| FFV1 on box-avg3, **total (both channels)** | **7.610** | **7.633** |
+
+Round-trip verified bit-exact both scales. The averaged channel genuinely
+does compress better than raw frames (confirms the noise-reduction
+intuition -- real, ~0.49 bpp cheaper). But the *total* is the worst of
+everything tried here: exact recovery needs the remainder channel too, and
+its entropy floor is `log2(3) ≈ 1.585 bits/px` (FFV1 -- a purely spatial
+codec with no efficient small-alphabet mode -- actually spends ~2.2
+bits/px on it, worse than that floor). The ~0.5 bpp saved on the averaged
+channel doesn't come close to covering the ~1.6-2.2 bpp mandatory cost of
+the side channel.
+
+Why this can't work as a codec-level trick at all: box-averaging-then-
+storing-the-remainder is a *bijective* reparametrization of the same
+frames, so it cannot reduce total information content, only reshuffle
+which channel carries it. It only pays off if the actual back-end coder
+exploits the new channel much better than the old one -- FFV1 can (a bit)
+for the smoothed average, but has no temporal model at all to help with
+the remainder, so this mostly just re-exposes FFV1's core limitation
+(spatial-only) rather than working around it. Even an idealized entropy
+coder for the remainder (1.585 bpp instead of FFV1's ~2.2) would still
+total ~6.99 bpp -- still worse than plain raw-frame FFV1 (5.90 bpp). This
+is a point in favor of the project's actual thesis: this kind of gain
+needs a coder that models space AND time jointly (the learned CNN), not a
+hand-crafted reversible transform feeding a spatial-only codec.
+
 ## Two bugs found the hard way (RunAI job history)
 
 1. **Nested-quote corruption in `runai workspace submit --command`.** A
