@@ -144,6 +144,45 @@ on what a real, causally-honest deployed codec would achieve, not the
 final answer. Building that causal path and re-measuring the gap is the
 single most important piece of remaining work.
 
+## FFV1 on raw frames vs. temporal diff (2026-09-10)
+
+`baselines.py`'s FFV1 encoder was only ever run on raw consecutive frames
+(`P_1, P_2, ..., P_n`) -- FFV1 itself is an *intra*-frame codec (spatial
+median-predictor only, no temporal referencing), so it was never exploiting
+frame-to-frame redundancy at all. Tried the obvious alternative: encode the
+temporal-diff stream instead (`P_1, P_2-P_1, P_3-P_2, ...`, biased by
+`+4095` to stay unsigned/losslessly invertible -- see
+`frames_to_temporal_diff`/`temporal_diff_to_frames`), so FFV1's spatial
+predictor now sees a per-pixel diff image instead of the raw frame.
+
+Measured on the holdout range (both a 200-frame slice matching the
+original baseline measurement, and the full 4000-frame holdout):
+
+| | bpp (200 frames) | bpp (4000 frames) |
+|---|---|---|
+| FFV1 on raw frames | 5.892 | 5.900 |
+| FFV1 on temporal diff | 6.176 | 6.187 |
+
+**Temporal diffing makes it WORSE**, by ~0.29 bpp, consistently at both
+scales (round-trip verified bit-exact both times -- this is a real,
+lossless comparison, not an estimate). Counter-intuitive if you're used to
+video codecs where temporal prediction helps, but it makes sense here: the
+data is shot-noise-dominated, so `P_i` and `P_{i-1}` each carry their own
+~independent noise realization on top of a slowly-varying (rotation-driven)
+signal. Diffing cancels the correlated, spatially-smooth signal component
+that FFV1's own intra-frame predictor already handles well, and leaves
+behind noise from *two* frames instead of one (variance roughly doubles) --
+harder for a purely spatial predictor to compress, not easier. Diffing
+would only help a codec that also has a temporal model to exploit, or on
+data where per-pixel signal changes dominate over noise -- neither applies
+to this codec's native-noise CT stream.
+
+(Small numeric gap vs. the original recorded `ffv1_bpp=5.602`: that number
+predates `DataConfig`'s 2026-09-08 widening to the current holdout range,
+so it's a genuinely different frame range, not a methodology
+discrepancy -- both measurements above used identical code and are
+internally consistent with each other.)
+
 ## Two bugs found the hard way (RunAI job history)
 
 1. **Nested-quote corruption in `runai workspace submit --command`.** A

@@ -129,8 +129,11 @@ def main():
     if args.skip_baselines:
         print("[eval] --skip_baselines set: not recomputing HEVC/FFV1 (needs ffmpeg). "
               "Last measured on RunAI (200 held-out frames, same dataset): "
-              "hevc12_bpp=6.266, ffv1_bpp=5.602 -- compare against those, don't treat "
-              "their absence here as 'no baseline'.")
+              "hevc12_bpp=6.266, ffv1_bpp=5.602. Also measured (sandbox, 2026-09-10, "
+              "200- and 4000-frame holdout): ffv1_diff_bpp is WORSE than ffv1_bpp by "
+              "~0.29 bpp (temporal-diff FFV1 hurts on this noisy data, see README.md "
+              "'FFV1 on raw frames vs. temporal diff'). Compare against these, don't "
+              "treat their absence here as 'no baseline'.")
     else:
         quant_arr = np.stack([
             quantize_to_12bit(
@@ -142,8 +145,10 @@ def main():
         fps = ds.profile.fps
         hevc_bytes = baselines.encode_hevc12_lossless(quant_arr, fps=fps)
         ffv1_bytes = baselines.encode_ffv1_lossless(quant_arr, fps=fps)
+        ffv1_diff_bytes = baselines.encode_ffv1_lossless_diff(quant_arr, fps=fps)
         result["hevc12_bpp"] = baselines.bits_per_pixel(hevc_bytes, *quant_arr.shape)
         result["ffv1_bpp"] = baselines.bits_per_pixel(ffv1_bytes, *quant_arr.shape)
+        result["ffv1_diff_bpp"] = baselines.bits_per_pixel(ffv1_diff_bytes, *quant_arr.shape)
     out_path = ckpt_dir / "eval_result.json"
     out_path.write_text(json.dumps(result, indent=2))
     print(json.dumps({k: v for k, v in result.items() if k != "per_frame"}, indent=2))

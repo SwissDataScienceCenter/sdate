@@ -38,12 +38,14 @@ def _run(cmd: list) -> None:
         )
 
 
-def _frames_to_raw_bytes(frames: np.ndarray) -> bytes:
-    """frames: (T, H, W) uint16 in [0, 4095]."""
+def _frames_to_raw_bytes(frames: np.ndarray, max_val: int = 4095) -> bytes:
+    """frames: (T, H, W) uint16 in [0, max_val]. ``max_val`` is 4095 for raw
+    12-bit frames but wider (see ``_DIFF_BIAS``) for a biased temporal-diff
+    stream, which still fits the same uint16/gray16le container."""
     if frames.dtype != np.uint16:
         raise ValueError(f"expected uint16, got {frames.dtype}")
-    if frames.max() > 4095:
-        raise ValueError(f"expected values in [0,4095], got max={frames.max()}")
+    if frames.max() > max_val:
+        raise ValueError(f"expected values in [0,{max_val}], got max={frames.max()}")
     return np.ascontiguousarray(frames).tobytes()
 
 
@@ -75,13 +77,18 @@ def decode_hevc12_lossless(encoded: bytes, h: int, w: int) -> np.ndarray:
     return arr.reshape(-1, h, w)
 
 
-def encode_ffv1_lossless(frames: np.ndarray, fps: float = 30.0) -> bytes:
-    """frames: (T, H, W) uint16 in [0, 4095]. Returns the encoded .mkv bytes."""
+def encode_ffv1_lossless(frames: np.ndarray, fps: float = 30.0, max_val: int = 4095) -> bytes:
+    """frames: (T, H, W) uint16 in [0, max_val]. Returns the encoded .mkv bytes.
+
+    ``max_val`` defaults to 4095 (raw 12-bit frames) but is wider for a
+    biased temporal-diff stream (see ``encode_ffv1_lossless_diff``) -- FFV1
+    itself is agnostic, gray16le already covers the full range either way.
+    """
     t, h, w = frames.shape
     with tempfile.TemporaryDirectory() as td:
         raw_path = Path(td) / "in.raw"
         out_path = Path(td) / "out.mkv"
-        raw_path.write_bytes(_frames_to_raw_bytes(frames))
+        raw_path.write_bytes(_frames_to_raw_bytes(frames, max_val=max_val))
         _run([
             FFMPEG, "-y",
             "-f", "rawvideo", "-pix_fmt", "gray16le", "-s", f"{w}x{h}", "-r", str(fps),
@@ -105,3 +112,42 @@ def decode_ffv1_lossless(encoded: bytes, h: int, w: int) -> np.ndarray:
 
 def bits_per_pixel(encoded: bytes, n_frames: int, h: int, w: int) -> float:
     return len(encoded) * 8 / (n_frames * h * w)
+
+
+# Max magnitude of a 12-bit-to-12-bit signed diff (P_i - P_{i-1} in
+# [-4095, 4095]) -- biasing by this keeps the diff stream unsigned (fits
+# gray16le, same container FFV1 already uses) without touching entropy: a
+# constant per-pixel offset doesn't change FFV1's own (median-predictor)
+# residuals, it just shifts everything into a representable range.
+_DIFF_BIAS = 4095
+
+
+def frames_to_temporal_diff(frames: np.ndarray) -> np.ndarray:
+    """(T, H, W) uint16 in [0, 4095] -> temporal-diff stream, same dtype/shape.
+
+    ``out[0] = frames[0]`` (first frame unchanged), ``out[i] = frames[i] -
+    frames[i-1] + _DIFF_BIAS`` for i>0. Exactly invertible by
+    :func:`temporal_diff_to_frames` -- this is a lossless reparametrization,
+    not a new compression step by itself.
+    """
+    diffs = frames.astype(np.int32)
+    out = diffs.copy()
+    out[1:] = diffs[1:] - diffs[:-1] + _DIFF_BIAS
+    return out.astype(np.uint16)
+
+
+def temporal_diff_to_frames(diffs: np.ndarray) -> np.ndarray:
+    """Exact inverse of :func:`frames_to_temporal_diff`."""
+    d = diffs.astype(np.int32)
+    d[1:] -= _DIFF_BIAS
+    return np.cumsum(d, axis=0).astype(np.uint16)
+
+
+def encode_ffv1_lossless_diff(frames: np.ndarray, fps: float = 30.0) -> bytes:
+    """FFV1 applied to the temporal-diff stream instead of raw frames."""
+    return encode_ffv1_lossless(frames_to_temporal_diff(frames), fps=fps, max_val=2 * _DIFF_BIAS)
+
+
+def decode_ffv1_lossless_diff(encoded: bytes, h: int, w: int) -> np.ndarray:
+    """Inverse of :func:`encode_ffv1_lossless_diff` -- returns raw frames."""
+    return temporal_diff_to_frames(decode_ffv1_lossless(encoded, h, w))
